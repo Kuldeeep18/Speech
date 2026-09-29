@@ -33,6 +33,7 @@ from nemo.collections.asr.parts.preprocessing.perturb import WhiteNoisePerturbat
 from nemo.collections.asr.parts.preprocessing.segment import AudioSegment
 from nemo.collections.asr.parts.utils.manifest_utils import read_manifest
 from nemo.collections.common.data.dataset import ConcatDataset
+from nemo.collections.common.data.lhotse.audio_loading import LhotseAudioLoadingDatasetMixin
 from nemo.collections.common.parts.preprocessing.manifest import get_full_path
 from nemo.core.classes import Serialization
 from nemo.utils import logging
@@ -479,7 +480,7 @@ class TarredAudioNoiseDataset(audio_to_text.TarredAudioToCharDataset):
         return _audio_noise_collate_fn(batch, self.batch_augmentor, self.return_noise)
 
 
-class LhotseAudioNoiseDataset(torch.utils.data.Dataset):
+class LhotseAudioNoiseDataset(LhotseAudioLoadingDatasetMixin, torch.utils.data.Dataset):
     def __init__(
         self,
         cfg: DictConfig,
