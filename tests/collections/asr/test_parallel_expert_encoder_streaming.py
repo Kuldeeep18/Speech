@@ -22,7 +22,12 @@ import pytest
 import torch
 from omegaconf import DictConfig
 
-from nemo.collections.asr.modules.parallel_expert_encoder import ParallelExpertEncoder, StreamingParallelExpertEncoder
+from nemo.collections.asr.modules.parallel_expert_encoder import (
+    ParallelExpertEncoder,
+    ParallelExpertEncoderPT,
+    StreamingParallelExpertEncoder,
+    StreamingParallelExpertEncoderPT,
+)
 from nemo.collections.asr.parts.mixins.streaming import StreamingEncoder
 from tests.collections.asr.test_parallel_expert_encoder import (
     _MEL_FEATURES,
@@ -169,6 +174,42 @@ def test_offline_forward_is_inherited_unchanged():
     with torch.no_grad():
         base_out, base_len = base(audio_signal=mel, length=length, spk_targets=spk_targets.clone())
         strm_out, strm_len = streaming(audio_signal=mel, length=length, spk_targets=spk_targets.clone())
+    assert torch.equal(base_out, strm_out)
+    assert torch.equal(base_len, strm_len)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("with_targets", [True, False], ids=["oracle_targets", "diarizer_predictions"])
+def test_streaming_bundle_shell_restores_the_same_weights_and_offline_outputs(tmp_path, with_targets):
+    """Compatibility pin for mounting bundles as the streaming class (StreamingSTT, P-2).
+
+    The same ``.nemo`` strict-loads through both shells with an identical state dict, and the offline
+    forward is the same, so the class change only adds the streaming interface.
+    """
+    from tests.collections.asr.test_parallel_expert_encoder import write_toy_bundle
+
+    torch.manual_seed(0)
+    bundle = write_toy_bundle(
+        tmp_path / 'pe.nemo',
+        encoder=build_toy_streaming_pe_encoder(),
+        asr_encoder_cfg=streaming_asr_encoder_cfg(),
+        asr_normalize_type=None,
+    )
+    base = ParallelExpertEncoderPT.load_from_nemo(bundle, strict=True).eval()
+    streaming = StreamingParallelExpertEncoderPT.load_from_nemo(bundle, strict=True).eval()
+    assert isinstance(base, ParallelExpertEncoder) and not isinstance(base, StreamingEncoder)
+    assert isinstance(streaming, StreamingParallelExpertEncoder)
+
+    base_state, streaming_state = base.state_dict(), streaming.state_dict()
+    assert list(base_state) == list(streaming_state)
+    assert all(torch.equal(base_state[key], streaming_state[key]) for key in base_state)
+
+    mel = torch.randn(2, _MEL_FEATURES, 128)
+    length = torch.tensor([128, 96])
+    spk_targets = torch.rand(2, 128 // _SUBSAMPLING_FACTOR, _N_SPK) if with_targets else None
+    with torch.no_grad():
+        base_out, base_len = base(audio_signal=mel, length=length, spk_targets=spk_targets)
+        strm_out, strm_len = streaming(audio_signal=mel, length=length, spk_targets=spk_targets)
     assert torch.equal(base_out, strm_out)
     assert torch.equal(base_len, strm_len)
 

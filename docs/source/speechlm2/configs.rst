@@ -474,7 +474,16 @@ A ``ParallelExpertEncoder`` replaces the perception encoder, either from a self-
 (``model.pe_encoder_path``, optionally with ``model.pe_encoder_overrides``) or assembled from an ASR
 and a Sortformer checkpoint (``model.parallel_expert_encoder`` with ``asr_model``, ``diar_model``
 and any encoder constructor argument). Every applied override is logged when the encoder is
-mounted. The keys accepted in ``model.pe_encoder_overrides``:
+mounted.
+
+StreamingSTT models decode chunk by chunk, so they mount a ``StreamingParallelExpertEncoder`` on
+both routes: a bundle always mounts as the streaming class, whatever ``target`` its
+``model_config.yaml`` names, and the two-checkpoint route does so unless
+``model.parallel_expert_encoder.streaming`` is ``false``. A bundle's weights and offline outputs are
+the same for both classes; the streaming class only adds the cache-aware streaming interface.
+SALM's bundle mount is unchanged (a local ``.nemo`` mounts as the plain ``ParallelExpertEncoder``).
+
+The keys accepted in ``model.pe_encoder_overrides``:
 
 .. list-table::
    :header-rows: 1

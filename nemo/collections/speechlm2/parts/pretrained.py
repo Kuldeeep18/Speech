@@ -27,6 +27,7 @@ from nemo.collections.asr.modules.parallel_expert_encoder import (
     ParallelExpertEncoder,
     ParallelExpertEncoderPT,
     StreamingParallelExpertEncoder,
+    StreamingParallelExpertEncoderPT,
 )
 from nemo.collections.speechlm2.modules import AudioPerceptionModule
 from nemo.collections.speechlm2.parts.model_loading import load_pretrained_nemo, load_pretrained_nemo_config
@@ -413,7 +414,7 @@ def parallel_expert_encoder_cfg_keys(cfg) -> tuple:
     return PARALLEL_EXPERT_ENCODER_BUNDLE_CFG_KEYS
 
 
-def setup_parallel_expert_encoder(model: torch.nn.Module):
+def setup_parallel_expert_encoder(model: torch.nn.Module, *, streaming: bool = False):
     """Mount the external perception encoder from ``model.pe_encoder_path``.
 
     This is an encoder replacement, not a training-checkpoint restore. It keeps
@@ -424,6 +425,14 @@ def setup_parallel_expert_encoder(model: torch.nn.Module):
     The replacement expects un-normalised mels and applies ASR normalisation
     internally, so the outer perception preprocessor
     normalisation is disabled when the bundle is mounted.
+
+    Args:
+        model: The model whose ``perception.encoder`` is replaced.
+        streaming: Mount a :class:`StreamingParallelExpertEncoder`, for models that decode chunk by
+            chunk (StreamingSTT). The bundle's weights and offline forward are the same for both
+            classes; the streaming class only adds the cache-aware streaming interface. ``False``
+            (SALM) loads through :class:`ParallelExpertEncoderPT` as before, which mounts a local
+            ``.nemo`` as the plain :class:`ParallelExpertEncoder`.
     """
     pe_encoder_path = model.cfg.get("pe_encoder_path", None)
     if pe_encoder_path in (None, "", False):
@@ -446,7 +455,8 @@ def setup_parallel_expert_encoder(model: torch.nn.Module):
             "feature extractors) need a separate implementation."
         )
 
-    pe_encoder = ParallelExpertEncoderPT.load_from_nemo(
+    loader_cls = StreamingParallelExpertEncoderPT if streaming else ParallelExpertEncoderPT
+    pe_encoder = loader_cls.load_from_nemo(
         pe_encoder_path,
         map_location="cpu",
         strict=True,

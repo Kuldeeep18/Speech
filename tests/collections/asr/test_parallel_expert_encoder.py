@@ -15,6 +15,7 @@
 
 import io
 import tarfile
+from typing import Optional
 
 import pytest
 import torch
@@ -1208,9 +1209,14 @@ def toy_bundle_config(**overrides) -> DictConfig:
     return OmegaConf.merge(cfg, OmegaConf.create(overrides))
 
 
-def write_toy_bundle(path, **cfg_overrides) -> str:
-    """Write a loadable PE ``.nemo`` (``model_config.yaml`` + ``model_weights.ckpt``) and return its path."""
-    state = {f'encoder.{key}': value for key, value in build_toy_pe_encoder().state_dict().items()}
+def write_toy_bundle(path, encoder: Optional[ParallelExpertEncoder] = None, **cfg_overrides) -> str:
+    """Write a loadable PE ``.nemo`` (``model_config.yaml`` + ``model_weights.ckpt``) and return its path.
+
+    ``encoder`` supplies the weights (default: :func:`build_toy_pe_encoder`); ``cfg_overrides`` must
+    describe the same architecture, e.g. ``asr_encoder_cfg`` for a cache-aware ASR branch.
+    """
+    encoder = build_toy_pe_encoder() if encoder is None else encoder
+    state = {f'encoder.{key}': value for key, value in encoder.state_dict().items()}
     weights = io.BytesIO()
     torch.save(state, weights)
     members = {

@@ -799,3 +799,20 @@ def test_parallel_expert_encoder_cfg_keys_only_when_a_bundle_is_mounted():
     keys = pretrained.parallel_expert_encoder_cfg_keys(DictConfig({"pe_encoder_path": "/tmp/pe.nemo"}))
     assert {"pe_encoder_overrides", "encoder_chunk_size_seconds", "spk_kernel_scale"} <= set(keys)
     assert pretrained.parallel_expert_encoder_cfg_keys(DictConfig({"pe_encoder_overrides": {}})) == ()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [({}, "ParallelExpertEncoder"), ({"streaming": True}, "StreamingParallelExpertEncoder")],
+    ids=["default_plain", "streaming"],
+)
+def test_bundle_mount_class_follows_the_streaming_flag(tmp_path, cpu_default_device, kwargs, expected):
+    """StreamingSTT asks for the streaming class; the default (SALM) keeps the plain encoder."""
+    from tests.collections.asr.test_parallel_expert_encoder import write_toy_bundle
+
+    model = _pe_mount_model({"pe_encoder_path": write_toy_bundle(tmp_path / "pe.nemo"), "perception": {}})
+
+    pretrained.setup_parallel_expert_encoder(model, **kwargs)
+
+    assert type(model.perception.encoder).__name__ == expected

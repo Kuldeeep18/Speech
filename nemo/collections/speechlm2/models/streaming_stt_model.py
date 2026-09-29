@@ -511,7 +511,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 "checkpoints); they build the same encoder from different sources."
             )
         if self.core_cfg.pe_encoder_path:
-            setup_parallel_expert_encoder(self)
+            # Chunked decoding needs the streaming interface, as on the two-checkpoint route.
+            setup_parallel_expert_encoder(self, streaming=True)
         elif self.core_cfg.parallel_expert_encoder:
             setup_parallel_expert_encoder_from_checkpoints(self)
 

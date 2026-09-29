@@ -19,7 +19,8 @@
 it has to be repeated. Without it, `model.pe_encoder_path` / `model.parallel_expert_encoder` are
 silently ignored under Automodel and training runs with a plain ASR encoder.
 
-These are source-level checks so they stay cheap and do not need checkpoints or a GPU.
+Most checks are source-level, so they stay cheap and do not need checkpoints or a GPU. The
+behavioural tests mount a toy bundle `.nemo` into a real `StreamingSTTModel` over a tiny LLM.
 """
 
 import ast
@@ -82,6 +83,29 @@ def test_pe_mount_runs_after_perception_and_before_freeze(path, fn):
     assert calls[MOUNTS[0]] < calls["_apply_freeze_config"], "PE mount runs after the freeze config"
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "path, fn",
+    [(BASE, "__init__"), (AUTOMODEL, "configure_model")],
+    ids=["StreamingSTTModel", "StreamingSTTModelAutomodel"],
+)
+def test_both_paths_mount_a_bundle_as_the_streaming_encoder(path, fn):
+    """Both models decode chunk by chunk, so both must ask the bundle mount for the streaming class.
+    The Automodel path cannot be built on CPU without Automodel; the behavioural test below covers
+    `StreamingSTTModel`."""
+    calls = [
+        node
+        for node in ast.walk(_function_node(path, fn))
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == MOUNTS[0]
+    ]
+    assert calls, f"{path.name}:{fn} does not call {MOUNTS[0]}"
+    for call in calls:
+        streaming = [kw.value for kw in call.keywords if kw.arg == "streaming"]
+        assert (
+            streaming and isinstance(streaming[0], ast.Constant) and streaming[0].value is True
+        ), f"{path.name}:{call.lineno} mounts a bundle without streaming=True"
+
+
 # Keys the bundle mount reads from the raw `model.cfg` rather than from `StreamingSTTModelConfig`.
 _PE_BUNDLE_MOUNT_KEYS = {
     "pe_encoder_overrides": {"sync_max_audio_length": False},
@@ -122,3 +146,63 @@ def test_no_unsupported_warning_for_pe_keys(tmp_path, monkeypatch):
     # ...and the mount did honour them.
     assert model.perception.encoder.asr_encoder.sync_max_audio_length is False
     assert model.perception.encoder.chunk_size_seconds == 1.0
+
+
+def _write_streaming_toy_bundle(path) -> str:
+    """A toy PE bundle whose ASR branch is cache-aware, so chunked decoding can run over it."""
+    from tests.collections.asr.test_parallel_expert_encoder import write_toy_bundle
+    from tests.collections.asr.test_parallel_expert_encoder_streaming import (
+        build_toy_streaming_pe_encoder,
+        streaming_asr_encoder_cfg,
+    )
+
+    return write_toy_bundle(
+        path,
+        encoder=build_toy_streaming_pe_encoder(),
+        asr_encoder_cfg=streaming_asr_encoder_cfg(),
+        asr_normalize_type=None,
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("state_machine", [False, True], ids=["chunked", "state_machine"])
+def test_bundle_mounts_the_streaming_encoder_and_chunked_generate_runs(tmp_path, monkeypatch, state_machine):
+    """A StreamingSTT model decodes chunk by chunk, so a bundle (`model.pe_encoder_path`) must mount
+    a `StreamingParallelExpertEncoder`, as the two-checkpoint route already does. Mounting the plain
+    `ParallelExpertEncoder` fails at the first chunk (`AttributeError: ... 'setup_streaming_params'`)."""
+    import torch
+
+    from nemo.collections.asr.modules.parallel_expert_encoder import StreamingParallelExpertEncoder
+    from nemo.collections.asr.parts.mixins.streaming import StreamingEncoder
+    from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel
+    from tests.collections.speechlm2.test_streaming_stt_dynamic_diarizer import (
+        CHUNK_SIZE,
+        _tiny_llm,
+        _unequal_length_audio,
+        make_pe_cfg,
+    )
+
+    previous = torch.get_default_device()
+    torch.set_default_device("cpu")
+    _tiny_llm(monkeypatch)
+    try:
+        model = StreamingSTTModel(make_pe_cfg(pe_encoder_path=_write_streaming_toy_bundle(tmp_path / "pe.nemo")))
+        model = model.eval()
+        encoder = model.perception.encoder
+        assert isinstance(encoder, StreamingParallelExpertEncoder), type(encoder).__name__
+        assert isinstance(encoder, StreamingEncoder)
+
+        audios, lengths = _unequal_length_audio()
+        with torch.no_grad():
+            result = model.generate(
+                audios=audios,
+                audio_lens=torch.tensor(lengths),
+                system_prompt="Transcribe the audio into text.",
+                max_new_tokens=8,
+                use_state_machine_inference=state_machine,
+                chunk_size_override=CHUNK_SIZE,
+            )
+    finally:
+        torch.set_default_device(previous)
+    assert len(result.texts) == len(lengths)
+    assert all(isinstance(text, str) for text in result.texts)
