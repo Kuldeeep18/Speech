@@ -461,6 +461,45 @@ Perception Module
 - **conv_context_size**: Context type for convolutions ("causal" or "regular")
 - **n_layers**: Number of encoder layers
 - **d_model**: Model dimension size
+- **sync_max_audio_length**: Whether the encoder all-reduces the longest input length across ranks
+  on every forward. Set it to ``false`` when ranks run a data-dependent number of encoder forwards
+  (for example decode-only validation), or DDP can deadlock. When a ``ParallelExpertEncoder`` is
+  mounted, this value is applied to both of its branches, unless the encoder's own settings below
+  set it.
+
+Parallel Expert Encoder
+^^^^^^^^^^^^^^^^^^^^^^^
+
+A ``ParallelExpertEncoder`` replaces the perception encoder, either from a self-contained bundle
+(``model.pe_encoder_path``, optionally with ``model.pe_encoder_overrides``) or assembled from an ASR
+and a Sortformer checkpoint (``model.parallel_expert_encoder`` with ``asr_model``, ``diar_model``
+and any encoder constructor argument). Every applied override is logged when the encoder is
+mounted. The keys accepted in ``model.pe_encoder_overrides``:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Key
+     - Effect
+   * - ``speaker_feature_config_version``, ``speaker_feature_mode``, ``speaker_activity_threshold``
+     - The speaker-feature fusion contract (thresholded or continuous speaker activity).
+   * - ``asr_normalize_type``, ``spk_kernel_scale``
+     - Normalization replayed on the ASR branch; scale of the speaker kernel.
+   * - ``missing_rttm_target``
+     - Rows whose speaker targets are all at or below this value have no RTTM and are filled from
+       the diarizer. Default ``-1.0``.
+   * - ``sync_max_audio_length``
+     - Applied to both branches (the ASR encoder and the diarizer's encoder). Takes precedence over
+       ``model.perception.encoder.sync_max_audio_length``. Unset keeps each branch's own value.
+       ``model.parallel_expert_encoder.sync_max_audio_length`` does the same on the two-checkpoint
+       route.
+   * - ``diar_normalize_type``
+     - Accepted only as ``null`` or ``NA``, which is what the encoder does: the diarizer always
+       receives un-normalized mels. Any other value is rejected.
+   * - ``chunk_size_seconds``, ``frame_shift_seconds``
+     - Rejected with an error naming the key, because nothing in this encoder reads them. Use
+       ``model.encoder_chunk_size_seconds`` to chunk long audio.
 
 Data Parameters
 ^^^^^^^^^^^^^^^

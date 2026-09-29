@@ -388,6 +388,31 @@ def setup_independent_speaker_encoder(model: torch.nn.Module):
     )
 
 
+# Model-level keys that `setup_parallel_expert_encoder` reads straight from the raw `model.cfg`
+# rather than from a model's config dataclass (the obsolete chunk keys are read to reject them).
+PARALLEL_EXPERT_ENCODER_BUNDLE_CFG_KEYS = (
+    "pe_encoder_overrides",
+    "encoder_chunk_size_seconds",
+    "encoder_chunk_batch_size",
+    "packed_encoder_sequences",
+    "spk_kernel_scale",
+    "pe_asr_chunk_size_seconds",
+    "pe_diar_chunk_size_seconds",
+)
+
+
+def parallel_expert_encoder_cfg_keys(cfg) -> tuple:
+    """The raw ``model.cfg`` keys the bundle mount consumes, or ``()`` when no bundle is configured.
+
+    For a model whose config dataclass does not declare these keys: pass them to ``to_dataclass`` as
+    ``consumed_keys`` so they are not reported as ignored. Without a bundle nothing reads them, and
+    the warning stays accurate.
+    """
+    if cfg.get("pe_encoder_path", None) in (None, "", False):
+        return ()
+    return PARALLEL_EXPERT_ENCODER_BUNDLE_CFG_KEYS
+
+
 def setup_parallel_expert_encoder(model: torch.nn.Module):
     """Mount the external perception encoder from ``model.pe_encoder_path``.
 
@@ -463,6 +488,7 @@ def setup_parallel_expert_encoder(model: torch.nn.Module):
 
     if (spk_kernel_scale := model.cfg.get("spk_kernel_scale", None)) is not None:
         pe_encoder.spk_kernel_scale = float(spk_kernel_scale)
+    _apply_perception_sync_flag(model, pe_encoder)
 
     # The outgoing width is unconstrained because that encoder is discarded.
     # The unchanged mel frontend and downstream adapter/projection must still match.
@@ -652,6 +678,7 @@ def mount_parallel_expert_encoder(model: torch.nn.Module, pe_encoder, source: st
     att_context_size = model.cfg.get("att_context_size", None)
     if att_context_size is not None and hasattr(pe_encoder, "set_att_context_size"):
         pe_encoder.set_att_context_size(att_context_size)
+    _apply_perception_sync_flag(model, pe_encoder)
 
     model.perception.encoder = pe_encoder
     logging.info(
@@ -664,6 +691,40 @@ def mount_parallel_expert_encoder(model: torch.nn.Module, pe_encoder, source: st
         bool(pe_encoder.freeze_diar),
         bool(pe_encoder.freeze_asr),
         prev_normalize,
+    )
+
+
+def _apply_perception_sync_flag(model: torch.nn.Module, pe_encoder) -> None:
+    """Carry ``model.perception.encoder.sync_max_audio_length`` over to both PE branches.
+
+    The mounted encoder replaces the one that key configures, so without this the setting is lost
+    and both branches keep all-reducing the longest input length on every forward, which deadlocks
+    a data-dependent decode under DDP. A PE-level setting (``pe_encoder_overrides`` or the bundle
+    config on the bundle route, ``model.parallel_expert_encoder`` on the two-checkpoint route) is
+    more specific and wins. With neither set, every branch keeps its own value.
+    """
+    encoder_cfg = model.cfg.get("perception", {}).get("encoder", None) or {}
+    flag = encoder_cfg.get("sync_max_audio_length", None)
+    explicit = getattr(pe_encoder, "explicit_sync_max_audio_length", None)
+    if explicit is not None:
+        logging.info(
+            "ParallelExpertEncoder sync_max_audio_length=%s on both branches, from the encoder's own config%s.",
+            explicit,
+            "" if flag is None else f" (model.perception.encoder.sync_max_audio_length={flag} is not applied)",
+        )
+        return
+    if flag is None:
+        return
+    if not hasattr(pe_encoder, "sync_max_audio_length"):
+        raise TypeError(
+            f"{type(pe_encoder).__name__} cannot honour model.perception.encoder.sync_max_audio_length; "
+            "it has no 'sync_max_audio_length' attribute."
+        )
+    pe_encoder.sync_max_audio_length = bool(flag)
+    logging.info(
+        "Set sync_max_audio_length=%s on both ParallelExpertEncoder branches from "
+        "model.perception.encoder.sync_max_audio_length.",
+        bool(flag),
     )
 
 

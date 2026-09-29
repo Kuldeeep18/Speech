@@ -53,6 +53,7 @@ from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, i
 from nemo.collections.speechlm2.parts.pretrained import (
     load_pretrained_hf,
     move_embedding,
+    parallel_expert_encoder_cfg_keys,
     setup_parallel_expert_encoder,
     setup_parallel_expert_encoder_from_checkpoints,
     setup_perception,
@@ -458,7 +459,9 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         super().__init__()
         self.save_hyperparameters()
         self.cfg = DictConfig(cfg)
-        self.core_cfg: StreamingSTTModelConfig = to_dataclass(StreamingSTTModelConfig, cfg)
+        self.core_cfg: StreamingSTTModelConfig = to_dataclass(
+            StreamingSTTModelConfig, cfg, consumed_keys=parallel_expert_encoder_cfg_keys(self.cfg)
+        )
         self._normalize_chunk_size()
 
         # --- LLM ---

@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from safetensors.torch import save_file
 
 from nemo.collections.speechlm2.parts import pretrained
@@ -699,3 +699,103 @@ def test_exclude_mtp_checkpoint_state_restores_hook_and_adapter_after_error():
     assert not model._load_state_dict_pre_hooks
     assert "from_hf" not in model.state_dict_adapter.__dict__
     assert model.state_dict_adapter.from_hf.__func__ is IdentityStateDictAdapter.from_hf
+
+
+# ---------------------------------------------------------------------------------------------
+# ParallelExpertEncoder mounts: the perception encoder's sync flag reaches both PE branches
+# ---------------------------------------------------------------------------------------------
+@pytest.fixture
+def cpu_default_device():
+    """Pin CPU, and restore. Sibling modules set a CUDA default at import and never put it back."""
+    previous = torch.get_default_device()
+    torch.set_default_device("cpu")
+    yield
+    torch.set_default_device(previous)
+
+
+def _pe_mount_model(cfg: dict) -> SimpleNamespace:
+    """A model stand-in with just what the PE mounts read: ``cfg`` and a 32-wide perception stack."""
+    return SimpleNamespace(
+        cfg=DictConfig(cfg),
+        perception=SimpleNamespace(
+            encoder=SimpleNamespace(d_model=32),
+            proj=torch.nn.Linear(32, 8),
+            preprocessor=SimpleNamespace(featurizer=SimpleNamespace(normalize="per_feature")),
+        ),
+    )
+
+
+def _perception_cfg(sync_flag) -> dict:
+    encoder = {} if sync_flag is None else {"sync_max_audio_length": sync_flag}
+    return {"encoder": encoder, "preprocessor": {"features": 128, "normalize": "per_feature"}}
+
+
+def _branch_sync_flags(model) -> tuple:
+    encoder = model.perception.encoder
+    return encoder.asr_encoder.sync_max_audio_length, encoder.diarization_model.encoder.sync_max_audio_length
+
+
+# (perception.encoder flag, PE-level flag) -> expected (ASR branch, diarizer encoder) flags. The toy
+# branches default to True, so every False below is a value that reached them.
+_SYNC_FLAG_CASES = [
+    pytest.param(False, None, (False, False), id="perception_encoder"),
+    pytest.param(None, False, (False, False), id="pe_level"),
+    pytest.param(True, False, (False, False), id="pe_level_wins_over_perception_encoder"),
+    pytest.param(None, None, (True, True), id="unset_keeps_branch_defaults"),
+]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("perception_flag, pe_flag, expected", _SYNC_FLAG_CASES)
+def test_two_checkpoint_mount_honours_sync_flag(monkeypatch, cpu_default_device, perception_flag, pe_flag, expected):
+    import nemo.collections.asr.modules.parallel_expert_encoder as pe_module
+    from tests.collections.asr.test_parallel_expert_encoder import toy_diarization_model_cfg
+    from tests.collections.asr.test_parallel_expert_encoder_streaming import (
+        build_toy_streaming_pe_encoder,
+        streaming_asr_encoder_cfg,
+    )
+
+    source = build_toy_streaming_pe_encoder()
+    sources = {
+        "toy/asr": (
+            {"encoder": OmegaConf.to_container(streaming_asr_encoder_cfg())},
+            {f"encoder.{k}": v for k, v in source.asr_encoder.state_dict().items()},
+        ),
+        "toy/diar": (OmegaConf.to_container(toy_diarization_model_cfg()), source.diarization_model.state_dict()),
+    }
+    monkeypatch.setattr(pe_module, "_resolve_branch_source", lambda name, model_cls, map_location: sources[name])
+    pe_cfg = {"asr_model": "toy/asr", "diar_model": "toy/diar", "asr_normalize_type": None}
+    if pe_flag is not None:
+        pe_cfg["sync_max_audio_length"] = pe_flag
+    model = _pe_mount_model({"parallel_expert_encoder": pe_cfg, "perception": _perception_cfg(perception_flag)})
+
+    pretrained.setup_parallel_expert_encoder_from_checkpoints(model)
+
+    assert _branch_sync_flags(model) == expected
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("perception_flag, pe_flag, expected", _SYNC_FLAG_CASES)
+def test_bundle_mount_honours_sync_flag(tmp_path, cpu_default_device, perception_flag, pe_flag, expected):
+    from tests.collections.asr.test_parallel_expert_encoder import write_toy_bundle
+
+    cfg = {
+        "pe_encoder_path": write_toy_bundle(tmp_path / "pe.nemo"),
+        "perception": _perception_cfg(perception_flag),
+    }
+    if pe_flag is not None:
+        cfg["pe_encoder_overrides"] = {"sync_max_audio_length": pe_flag}
+    model = _pe_mount_model(cfg)
+
+    pretrained.setup_parallel_expert_encoder(model)
+
+    assert _branch_sync_flags(model) == expected
+
+
+@pytest.mark.unit
+def test_parallel_expert_encoder_cfg_keys_only_when_a_bundle_is_mounted():
+    """The bundle mount's raw ``model.cfg`` keys are exempt from the dataclass warning only when
+    that mount runs; without a bundle, the warning is still the truth for them."""
+    keys = pretrained.parallel_expert_encoder_cfg_keys(DictConfig({"pe_encoder_path": "/tmp/pe.nemo"}))
+    assert {"pe_encoder_overrides", "encoder_chunk_size_seconds", "spk_kernel_scale"} <= set(keys)
+    assert pretrained.parallel_expert_encoder_cfg_keys(DictConfig({"pe_encoder_overrides": {}})) == ()

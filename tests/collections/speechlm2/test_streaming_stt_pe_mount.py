@@ -80,3 +80,45 @@ def test_pe_mount_runs_after_perception_and_before_freeze(path, fn):
     calls = _called_names(_function_node(path, fn))
     assert calls["setup_perception"] < calls[MOUNTS[0]], "PE mount runs before perception is built"
     assert calls[MOUNTS[0]] < calls["_apply_freeze_config"], "PE mount runs after the freeze config"
+
+
+# Keys the bundle mount reads from the raw `model.cfg` rather than from `StreamingSTTModelConfig`.
+_PE_BUNDLE_MOUNT_KEYS = {
+    "pe_encoder_overrides": {"sync_max_audio_length": False},
+    "encoder_chunk_size_seconds": 1.0,
+    "spk_kernel_scale": 1.0,
+    "packed_encoder_sequences": False,
+    "encoder_chunk_batch_size": None,
+}
+
+
+@pytest.mark.unit
+def test_no_unsupported_warning_for_pe_keys(tmp_path, monkeypatch):
+    """`to_dataclass` must not call the bundle mount's keys "not supported and will be ignored":
+    the mount reads and honours them. Keys nothing reads are still reported."""
+    import torch
+
+    import nemo.collections.speechlm2.parts.utils.misc as misc
+    from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel
+    from tests.collections.asr.test_parallel_expert_encoder import write_toy_bundle
+    from tests.collections.speechlm2.test_streaming_stt_dynamic_diarizer import _tiny_llm, make_pe_cfg
+
+    previous = torch.get_default_device()
+    torch.set_default_device("cpu")
+    warnings = []
+    monkeypatch.setattr(misc.logging, "warning", lambda msg, *args, **kwargs: warnings.append(msg % args))
+    _tiny_llm(monkeypatch)
+    try:
+        cfg = make_pe_cfg(pe_encoder_path=write_toy_bundle(tmp_path / "pe.nemo"), **_PE_BUNDLE_MOUNT_KEYS)
+        model = StreamingSTTModel(cfg)
+    finally:
+        torch.set_default_device(previous)
+
+    unsupported = [line for line in warnings if "not supported and will be ignored" in line]
+    assert unsupported, "the control key `optimizer` is no longer reported"
+    assert "optimizer" in unsupported[0]
+    for key in _PE_BUNDLE_MOUNT_KEYS:
+        assert all(key not in line for line in unsupported), f"{key!r} is reported as ignored: {unsupported}"
+    # ...and the mount did honour them.
+    assert model.perception.encoder.asr_encoder.sync_max_audio_length is False
+    assert model.perception.encoder.chunk_size_seconds == 1.0

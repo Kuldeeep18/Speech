@@ -1186,3 +1186,133 @@ def test_rttm_rows_are_fused_unchanged_by_the_splice_length(target_offset):
     asr_frames = seen["asr_frames"]
     fused_real = ParallelExpertEncoder._align_diar_frames(seen["targets"][:1], asr_frames)
     assert torch.equal(fused_real, ParallelExpertEncoder._align_diar_frames(real[None], asr_frames))
+
+
+# ----------------------------------------------------------------------------- #
+# Bundle config overrides and the sync flag
+# ----------------------------------------------------------------------------- #
+def toy_bundle_config(**overrides) -> DictConfig:
+    """``model_config.yaml`` of a self-contained PE bundle over the tiny ASR + diar configs."""
+    cfg = OmegaConf.create(
+        {
+            'target': 'nemo.collections.asr.modules.parallel_expert_encoder.ParallelExpertEncoderPT',
+            'asr_encoder_cfg': toy_asr_encoder_cfg(),
+            'diarization_model_cfg': toy_diarization_model_cfg(),
+            'asr_normalize_type': 'per_feature',
+            'online_inference_length': 500,
+            'speaker_feature_config_version': 1,
+            'speaker_feature_mode': 'thresholded',
+            'speaker_activity_threshold': 0.5,
+        }
+    )
+    return OmegaConf.merge(cfg, OmegaConf.create(overrides))
+
+
+def write_toy_bundle(path, **cfg_overrides) -> str:
+    """Write a loadable PE ``.nemo`` (``model_config.yaml`` + ``model_weights.ckpt``) and return its path."""
+    state = {f'encoder.{key}': value for key, value in build_toy_pe_encoder().state_dict().items()}
+    weights = io.BytesIO()
+    torch.save(state, weights)
+    members = {
+        'model_config.yaml': OmegaConf.to_yaml(toy_bundle_config(**cfg_overrides)).encode(),
+        'model_weights.ckpt': weights.getvalue(),
+    }
+    with tarfile.open(path, 'w') as archive:
+        for name, payload in members.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+    return str(path)
+
+
+def branch_sync_flags(enc) -> tuple:
+    """``sync_max_audio_length`` of the ASR branch and of the diarizer's encoder."""
+    return enc.asr_encoder.sync_max_audio_length, enc.diarization_model.encoder.sync_max_audio_length
+
+
+def _sync_flag_is_applied(enc):
+    assert branch_sync_flags(enc) == (False, False)
+
+
+def _missing_rttm_target_is_applied(enc):
+    assert enc.missing_rttm_target == -2.0
+    rows = torch.stack([torch.full((4, _N_SPK), -2.0), torch.full((4, _N_SPK), -1.0)])
+    assert enc.missing_rttm_rows(rows).tolist() == [True, False]
+
+
+@pytest.mark.unit
+def test_bundle_without_overrides_keeps_each_branch_sync_flag(tmp_path):
+    """Pin: no default changes. A bundle that does not set the flag keeps each branch's own value."""
+    enc = ParallelExpertEncoderPT.load_from_nemo(write_toy_bundle(tmp_path / 'pe.nemo'))
+    assert branch_sync_flags(enc) == (True, True)
+    assert enc.missing_rttm_target == -1.0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "overrides, check",
+    [
+        ({'sync_max_audio_length': False}, _sync_flag_is_applied),
+        ({'missing_rttm_target': -2.0}, _missing_rttm_target_is_applied),
+    ],
+    ids=["sync_max_audio_length", "missing_rttm_target"],
+)
+def test_bundle_overrides_are_applied(tmp_path, monkeypatch, overrides, check):
+    """Allow-listed overrides with a consumer reach the encoder, and each is logged."""
+    import nemo.collections.asr.modules.parallel_expert_encoder as pe_module
+
+    infos = []
+    monkeypatch.setattr(pe_module.logging, 'info', lambda msg, *args, **kwargs: infos.append(msg % args))
+    enc = ParallelExpertEncoderPT.load_from_nemo(write_toy_bundle(tmp_path / 'pe.nemo'), config_overrides=overrides)
+
+    check(enc)
+    (key,) = overrides
+    assert any(key in line for line in infos), f"no log line names the applied override {key!r}: {infos}"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "key, value",
+    [('diar_normalize_type', 'per_feature'), ('frame_shift_seconds', 0.02), ('chunk_size_seconds', 1.12)],
+    ids=["diar_normalize_type", "frame_shift_seconds", "chunk_size_seconds"],
+)
+def test_consumerless_bundle_overrides_are_explicit(tmp_path, key, value):
+    """Nothing in this encoder reads these keys, so an override that would change behaviour is
+    rejected with an error that names the key, instead of being accepted and silently dropped."""
+    bundle = write_toy_bundle(tmp_path / 'pe.nemo')
+    with pytest.raises(ValueError, match=key):
+        ParallelExpertEncoderPT.load_from_nemo(bundle, config_overrides={key: value})
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", [None, 'NA'])
+def test_diar_normalize_type_that_matches_the_encoder_is_accepted(tmp_path, value):
+    """Pin: the diarizer always receives un-normalised mels, so these values state what already
+    happens and keep loading (e.g. recipes that set ``diar_normalize_type: NA``)."""
+    enc = ParallelExpertEncoderPT.load_from_nemo(
+        write_toy_bundle(tmp_path / 'pe.nemo'), config_overrides={'diar_normalize_type': value}
+    )
+    assert branch_sync_flags(enc) == (True, True)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("flag", [False, True])
+def test_sync_max_audio_length_kwarg_sets_both_branches(flag):
+    diar_cfg = toy_diarization_model_cfg()
+    diar_cfg.encoder.sync_max_audio_length = not flag
+    asr_cfg = toy_asr_encoder_cfg()
+    asr_cfg.sync_max_audio_length = not flag
+    enc = build_toy_pe_encoder(asr_encoder_cfg=asr_cfg, diarization_model_cfg=diar_cfg, sync_max_audio_length=flag)
+    assert branch_sync_flags(enc) == (flag, flag)
+    assert enc.sync_max_audio_length is flag
+
+
+@pytest.mark.unit
+def test_unset_sync_max_audio_length_keeps_each_branch_value():
+    """Pin: without the kwarg, each branch keeps what its own config says."""
+    diar_cfg = toy_diarization_model_cfg()
+    diar_cfg.encoder.sync_max_audio_length = False
+    enc = build_toy_pe_encoder(diarization_model_cfg=diar_cfg)
+    assert branch_sync_flags(enc) == (True, False)
+    # The encoder-level flag reports whether ANY branch still all-reduces.
+    assert enc.sync_max_audio_length is True

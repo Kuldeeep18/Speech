@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Iterable
 from dataclasses import dataclass, fields
 
 import torch.nn as nn
@@ -21,17 +22,29 @@ from omegaconf import DictConfig, OmegaConf
 from nemo.utils import logging
 
 
-def to_dataclass(cls: dataclass, data: dict | DictConfig, add_if_missing: bool = False) -> dataclass:
+def to_dataclass(
+    cls: dataclass,
+    data: dict | DictConfig,
+    add_if_missing: bool = False,
+    consumed_keys: Iterable[str] = (),
+) -> dataclass:
+    """Build ``cls`` from the keys of ``data`` that are its fields.
+
+    Other keys are reported as ignored, except ``consumed_keys``: keys that the caller reads from
+    the raw config itself (they are still left out of the dataclass).
+    """
     supported = {f.name for f in fields(cls)}
     if isinstance(data, DictConfig):
         cfg_dict = OmegaConf.to_container(data, resolve=True)
     else:
         cfg_dict = dict(data)
     unsupported = [k for k in cfg_dict if k not in supported]
-    if unsupported and not add_if_missing:
+    consumed = set(consumed_keys)
+    ignored = [k for k in unsupported if k not in consumed]
+    if ignored and not add_if_missing:
         logging.warning(
             f"{cls.__name__}: the following config parameters are not supported and will be ignored: %s",
-            unsupported,
+            ignored,
         )
     filtered = {k: cfg_dict[k] for k in supported if k in cfg_dict}
     result = cls(**filtered)

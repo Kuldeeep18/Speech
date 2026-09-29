@@ -75,6 +75,7 @@ from nemo.collections.speechlm2.parts.automodel_lora import (
 from nemo.collections.speechlm2.parts.pretrained import (
     load_pretrained_automodel_llm,
     maybe_load_pretrained_models,
+    parallel_expert_encoder_cfg_keys,
     setup_parallel_expert_encoder,
     setup_parallel_expert_encoder_from_checkpoints,
     setup_perception,
@@ -135,7 +136,9 @@ class StreamingSTTModelAutomodel(StreamingSTTModel):
         super(StreamingSTTModel, self).__init__()
         self.save_hyperparameters()
         self.cfg = DictConfig(cfg)
-        self.core_cfg: StreamingSTTModelConfig = to_dataclass(StreamingSTTModelConfig, cfg)
+        self.core_cfg: StreamingSTTModelConfig = to_dataclass(
+            StreamingSTTModelConfig, cfg, consumed_keys=parallel_expert_encoder_cfg_keys(self.cfg)
+        )
         self._normalize_chunk_size()
 
         self.tokenizer = AutoTokenizer(self.core_cfg.pretrained_llm, use_fast=True)

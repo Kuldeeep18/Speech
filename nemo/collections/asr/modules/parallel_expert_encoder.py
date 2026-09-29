@@ -134,9 +134,7 @@ _SPEAKER_FEATURE_MODES = frozenset({_SPEAKER_FEATURE_MODE_CONTINUOUS, _SPEAKER_F
 _BUNDLE_CONFIG_OVERRIDE_KEYS = frozenset(
     {
         "asr_normalize_type",
-        "chunk_size_seconds",
         "diar_normalize_type",
-        "frame_shift_seconds",
         "missing_rttm_target",
         "speaker_activity_threshold",
         "speaker_feature_config_version",
@@ -145,6 +143,21 @@ _BUNDLE_CONFIG_OVERRIDE_KEYS = frozenset(
         "sync_max_audio_length",
     }
 )
+# Override keys that SALM-side recipes set but that nothing in this encoder consumes. Accepting them
+# would drop the value without a word, so each is refused with the reason and what to use instead.
+_UNCONSUMED_BUNDLE_OVERRIDE_KEYS = {
+    "chunk_size_seconds": (
+        "this encoder does not chunk its input by it; the SpeechLM mounts replace it with "
+        "model.encoder_chunk_size_seconds, so set that key instead"
+    ),
+    "frame_shift_seconds": (
+        "this encoder converts no durations to frames; its frame rate is fixed by the mel input and "
+        "the ASR branch's subsampling factor"
+    ),
+}
+# The diarizer branch always receives the un-normalised mels, so `diar_normalize_type` is accepted
+# only with a value that states exactly that.
+_DIAR_NORMALIZE_NOOP_VALUES = (None, "NA")
 
 
 def _normalize_speaker_feature_contract(
@@ -215,11 +228,28 @@ def _merge_bundle_config_overrides(cfg: DictConfig, config_overrides: Optional[M
         raise TypeError(
             f"ParallelExpertEncoder config_overrides must be a mapping, got {type(config_overrides).__name__}."
         )
+    unconsumed = sorted(set(config_overrides) & set(_UNCONSUMED_BUNDLE_OVERRIDE_KEYS))
+    if unconsumed:
+        reasons = "; ".join(f"{key!r}: {_UNCONSUMED_BUNDLE_OVERRIDE_KEYS[key]}" for key in unconsumed)
+        raise ValueError(f"ParallelExpertEncoder config_overrides keys {unconsumed} are not supported. {reasons}.")
     unknown = sorted(set(config_overrides) - _BUNDLE_CONFIG_OVERRIDE_KEYS)
     if unknown:
         supported = ", ".join(sorted(_BUNDLE_CONFIG_OVERRIDE_KEYS))
         raise ValueError(
             f"Unsupported ParallelExpertEncoder config_overrides keys {unknown}; supported keys: {supported}."
+        )
+    diar_normalize_type = config_overrides.get("diar_normalize_type", None)
+    if diar_normalize_type not in _DIAR_NORMALIZE_NOOP_VALUES:
+        raise ValueError(
+            f"ParallelExpertEncoder config_overrides diar_normalize_type={diar_normalize_type!r} is not supported: "
+            "the diarizer branch always receives un-normalised mels, so only null or 'NA' can be honoured."
+        )
+    for key in sorted(config_overrides):
+        logging.info(
+            "[ParallelExpertEncoder] Applying bundle config override %s=%r%s.",
+            key,
+            config_overrides[key],
+            " (no-op: the diarizer input is never normalised)" if key == "diar_normalize_type" else "",
         )
     return OmegaConf.merge(merged, OmegaConf.create(dict(config_overrides)))
 
@@ -302,6 +332,8 @@ class ParallelExpertEncoderPT(ModelPT):
             spk_kernel_row_stride=self._cfg.get('spk_kernel_row_stride', 1),
             spk_kernel_calibrate=self._cfg.get('spk_kernel_calibrate', False),
             speaker_row_offset=self._cfg.get('speaker_row_offset', 0),
+            missing_rttm_target=self._cfg.get('missing_rttm_target', -1.0),
+            sync_max_audio_length=self._cfg.get('sync_max_audio_length', None),
         )
         # Architecture-only snapshot, so an exported SpeechLM checkpoint can rebuild this encoder
         # without the original bundle. Stamped with the RESOLVED contract, not the raw config, so a
@@ -388,7 +420,10 @@ class ParallelExpertEncoderPT(ModelPT):
             config_overrides (Mapping, optional): Runtime-semantic bundle fields to override --
                 deliberately a small allow-list (see ``_BUNDLE_CONFIG_OVERRIDE_KEYS``) so a recipe
                 can resolve a legacy bundle's speaker-feature ambiguity without silently swapping
-                the saved architecture. Local ``.nemo`` paths only.
+                the saved architecture. Local ``.nemo`` paths only. Each applied override is logged.
+                ``chunk_size_seconds`` and ``frame_shift_seconds`` are refused because nothing here
+                consumes them, and ``diar_normalize_type`` accepts only ``None``/``'NA'`` because the
+                diarizer input is never normalised.
 
         Returns:
             The restored :class:`ParallelExpertEncoder`.
@@ -540,6 +575,12 @@ class ParallelExpertEncoder(nn.Module):
         diar_chunk_len (int, optional): Override the Sortformer's streaming ``chunk_len``; unset keeps
             the checkpoint's value. Distinct from ``online_inference_length``, which is PE's *ASR*
             long-form window.
+        missing_rttm_target (float): Rows whose targets are all ``<=`` this value had no RTTM and
+            are filled from the diarizer. Default ``-1.0``.
+        sync_max_audio_length (bool, optional): Set ``sync_max_audio_length`` on every encoder in
+            both branches (the ASR branch and the diarizer's encoder). ``False`` stops them from
+            all-reducing the longest input length on every forward, which deadlocks when ranks run
+            a data-dependent number of forwards. Unset (default) keeps each branch's own value.
     """
 
     def __init__(
@@ -565,6 +606,7 @@ class ParallelExpertEncoder(nn.Module):
         speaker_row_offset: int = 0,
         missing_rttm_target: float = -1.0,
         att_context_size: Optional[list] = None,
+        sync_max_audio_length: Optional[bool] = None,
     ):
         super().__init__()
 
@@ -595,6 +637,12 @@ class ParallelExpertEncoder(nn.Module):
                 f"({self.diarization_model.output_subsampling_factor}) to equal the ASR encoder subsampling factor "
                 f"({self.asr_encoder.subsampling_factor})."
             )
+
+        # None = each branch keeps its own flag. Recorded so the SpeechLM mounts can tell an explicit
+        # PE-level setting, which wins, from an unset one.
+        self.explicit_sync_max_audio_length = None if sync_max_audio_length is None else bool(sync_max_audio_length)
+        if self.explicit_sync_max_audio_length is not None:
+            self.sync_max_audio_length = self.explicit_sync_max_audio_length
 
         self.freeze_diar = freeze_diar
         self.freeze_asr = freeze_asr
@@ -799,6 +847,29 @@ class ParallelExpertEncoder(nn.Module):
         self.asr_encoder.att_context_size_all = [att_context_size]
         if getattr(self.asr_encoder, 'att_context_probs', None) is not None:
             self.asr_encoder.att_context_probs = [1.0]
+
+    @property
+    def sync_max_audio_length(self) -> bool:
+        """Whether any encoder in either branch all-reduces the longest input length per forward.
+
+        PE has no flag of its own: the collective lives in each branch's encoder
+        (``ConformerEncoder.update_max_seq_length``), so this reports, and sets, theirs.
+        """
+        return any(bool(module.sync_max_audio_length) for module in self._length_syncing_modules())
+
+    @sync_max_audio_length.setter
+    def sync_max_audio_length(self, value: bool) -> None:
+        for module in self._length_syncing_modules():
+            module.sync_max_audio_length = bool(value)
+
+    def _length_syncing_modules(self) -> List[nn.Module]:
+        """Every module in the ASR and diarizer branches that carries ``sync_max_audio_length``."""
+        return [
+            module
+            for branch in (self.asr_encoder, self.diarization_model)
+            for module in branch.modules()
+            if hasattr(module, 'sync_max_audio_length')
+        ]
 
     def _apply_diar_streaming_overrides(self) -> None:
         """Push only explicitly-configured streaming knobs onto the frozen Sortformer.
