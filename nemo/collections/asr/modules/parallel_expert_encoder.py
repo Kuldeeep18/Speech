@@ -1196,8 +1196,13 @@ class ParallelExpertEncoder(nn.Module):
             if spk_targets is None:
                 spk_targets = diar_preds
             else:
-                # Per-row substitution: keep real RTTM targets, replace only sentinel rows.
-                diar_preds = self._align_diar_frames(diar_preds, spk_targets.shape[1]).to(spk_targets.dtype)
+                # Per-row substitution: keep real RTTM targets, replace only sentinel rows. Splice at
+                # the longer of the two lengths, so a sentinel row keeps every diarizer frame (an
+                # all-sentinel batch then equals passing no targets) and a real row is only padded by
+                # repeat, as the fusion would pad it anyway.
+                splice_len = max(spk_targets.shape[1], diar_preds.shape[1])
+                spk_targets = self._align_diar_frames(spk_targets, splice_len)
+                diar_preds = self._align_diar_frames(diar_preds, splice_len).to(spk_targets.dtype)
                 spk_targets = torch.where(missing_rows.view(-1, 1, 1), diar_preds, spk_targets)
 
         if spk_targets is not None:

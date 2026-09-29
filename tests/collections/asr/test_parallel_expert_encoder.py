@@ -1128,3 +1128,61 @@ def test_offline_path_rejects_unpooled_high_resolution_predictions(monkeypatch):
 
     with torch.no_grad(), pytest.raises(ValueError, match=r"256 frames.*32"):
         enc(audio_signal=mels, length=length, spk_targets=targets)
+
+
+# ----------------------------------------------------------------------------- #
+# Sentinel splice length
+# ----------------------------------------------------------------------------- #
+@pytest.mark.unit
+@pytest.mark.parametrize("target_offset", [-1, 0, 1], ids=["T_spk<T_diar", "T_spk==T_diar", "T_spk>T_diar"])
+def test_all_sentinel_equals_no_targets(target_offset):
+    """A batch whose every row lacks an RTTM must be encoded exactly as if no targets were given.
+
+    The sentinel rows used to be spliced at the targets' length, so when the collated targets were
+    one frame shorter than the diarizer output (e.g. 112 mel frames -> 14 diarizer frames, 13
+    target frames) the diarizer's last frame was dropped and the fusion repeated the one before it.
+    """
+    enc = build_toy_pe_encoder().eval()
+    seen = capture_fusion_targets(enc)
+    n_mel = 112
+    mels = torch.randn(2, _MEL_FEATURES, n_mel)
+    length = torch.tensor([n_mel, n_mel])
+    n_diar = n_mel // _SUBSAMPLING_FACTOR
+    targets = torch.full((2, n_diar + target_offset, _N_SPK), -1.0)
+
+    with torch.no_grad():
+        no_targets, no_targets_len = enc(audio_signal=mels, length=length)
+        from_diarizer = seen["targets"]
+        sentinel, sentinel_len = enc(audio_signal=mels, length=length, spk_targets=targets)
+        spliced = seen["targets"]
+
+    # Compared on what the fusion aligns to the ASR grid: thresholding and `diar_norm` can hide a
+    # wrong frame in the fused output.
+    asr_frames = seen["asr_frames"]
+    assert torch.equal(
+        ParallelExpertEncoder._align_diar_frames(spliced, asr_frames),
+        ParallelExpertEncoder._align_diar_frames(from_diarizer, asr_frames),
+    )
+    assert torch.equal(sentinel_len, no_targets_len)
+    assert torch.equal(sentinel, no_targets)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("target_offset", [-1, 0, 1], ids=["T_spk<T_diar", "T_spk==T_diar", "T_spk>T_diar"])
+def test_rttm_rows_are_fused_unchanged_by_the_splice_length(target_offset):
+    """A row with real targets must reach the fusion as its own targets, aligned to the ASR length."""
+    enc = build_toy_pe_encoder().eval()
+    seen = capture_fusion_targets(enc)
+    n_mel = 112
+    mels = torch.randn(2, _MEL_FEATURES, n_mel)
+    length = torch.tensor([n_mel, n_mel])
+    n_frames = n_mel // _SUBSAMPLING_FACTOR + target_offset
+    real = torch.rand(n_frames, _N_SPK)
+    targets = torch.stack([real, torch.full((n_frames, _N_SPK), -1.0)])
+
+    with torch.no_grad():
+        enc(audio_signal=mels, length=length, spk_targets=targets.clone())
+
+    asr_frames = seen["asr_frames"]
+    fused_real = ParallelExpertEncoder._align_diar_frames(seen["targets"][:1], asr_frames)
+    assert torch.equal(fused_real, ParallelExpertEncoder._align_diar_frames(real[None], asr_frames))
