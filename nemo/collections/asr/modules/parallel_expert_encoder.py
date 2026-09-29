@@ -115,6 +115,12 @@ _NORMALIZE_UNSET = object()
 # changes a frozen branch's behaviour (e.g. sortformer-8spk ships fifo 0 / chunk 264 / cache 264).
 _DIAR_UNSET = object()
 
+# On the offline path both branches encode the same mels with the same subsampling factor, so
+# their frame counts differ by convolution rounding at most. A larger gap means the diarizer's
+# predictions are on another time grid (e.g. a high-resolution diarizer's unpooled 10 ms output),
+# which `_align_diar_frames` would otherwise truncate or stretch without a word.
+_MAX_DIAR_ASR_FRAME_MISMATCH = 2
+
 
 # --- Speaker-feature fusion contract -------------------------------------------------------
 # Ported from the SALM-side encoder so a bundle states, rather than implies, how its speaker
@@ -935,6 +941,26 @@ class ParallelExpertEncoder(nn.Module):
         return spk_targets
 
     @staticmethod
+    def _require_diar_on_asr_grid(diar_preds: torch.Tensor, asr_len: int) -> None:
+        """Raise if offline diarizer predictions are not on the ASR branch's frame grid.
+
+        Args:
+            diar_preds (Tensor): Diarizer predictions. Shape ``(B, T_diar, n_spk)``.
+            asr_len (int): Number of frames the ASR branch produced for the same mels.
+
+        Raises:
+            ValueError: If ``T_diar`` and ``asr_len`` differ by more than ``_MAX_DIAR_ASR_FRAME_MISMATCH``.
+        """
+        diar_len = diar_preds.shape[1]
+        if abs(diar_len - asr_len) > _MAX_DIAR_ASR_FRAME_MISMATCH:
+            raise ValueError(
+                f"The diarizer predicted {diar_len} frames but the ASR branch produced {asr_len} for the same "
+                f"audio; they may differ by at most {_MAX_DIAR_ASR_FRAME_MISMATCH}. The predictions are on a "
+                "different time grid (a high-resolution diarizer whose output was not pooled?), and aligning "
+                "them would truncate or stretch the speaker activity."
+            )
+
+    @staticmethod
     def _match_module_io(tensor: torch.Tensor, module: nn.Module) -> torch.Tensor:
         """Cast ``tensor`` to ``module``'s parameter device & dtype (mels arrive fp32, experts run bf16).
 
@@ -1101,6 +1127,18 @@ class ParallelExpertEncoder(nn.Module):
             spk_targets=spk_targets,
         )
 
+    def _align_diarization_output_resolution(
+        self, predictions: torch.Tensor, embedding_lengths: torch.Tensor
+    ) -> torch.Tensor:
+        """Map native Sortformer probabilities onto the ASR fusion grid."""
+        model = self.diarization_model
+        native_factor = 1 if model.high_resolution else int(model.encoder.subsampling_factor)
+        downsample_factor = int(model.output_subsampling_factor) // native_factor
+        if downsample_factor <= 1:
+            return predictions
+        native_lengths = embedding_lengths * (int(model.encoder.subsampling_factor) // native_factor)
+        return model.sortformer_modules.downsample_preds(predictions, downsample_factor, lengths=native_lengths)
+
     def _forward(
         self,
         audio_signal,
@@ -1113,6 +1151,7 @@ class ParallelExpertEncoder(nn.Module):
         # splice per row below.
         missing_rows = self.missing_rttm_rows(spk_targets)
         needs_diar = self._should_run_diarization(spk_targets, missing_rows)
+        diar_preds = None
         if needs_diar:
             # Cast fp32 mels to the diarizer's device/dtype before its conv subsampling.
             diar_signal = self._match_module_io(audio_signal, self.diarization_model)
@@ -1129,12 +1168,10 @@ class ParallelExpertEncoder(nn.Module):
                 )
             if isinstance(diar_preds, tuple):
                 diar_preds = diar_preds[0]
-            if spk_targets is None:
-                spk_targets = diar_preds
-            else:
-                # Per-row substitution: keep real RTTM targets, replace only sentinel rows.
-                diar_preds = self._align_diar_frames(diar_preds, spk_targets.shape[1]).to(spk_targets.dtype)
-                spk_targets = torch.where(missing_rows.view(-1, 1, 1), diar_preds, spk_targets)
+            # `forward_infer` returns a high-resolution diarizer's predictions every 10 ms. Pool
+            # them onto the ASR grid, as `SortformerEncLabelModel.forward` and the streaming step
+            # do; a no-op for a diarizer that already predicts at the ASR frame rate.
+            diar_preds = self._align_diarization_output_resolution(diar_preds, emb_seq_length)
 
         if self.asr_normalize_type:
             asr_audio_signal, _, _ = normalize_batch(
@@ -1153,6 +1190,15 @@ class ParallelExpertEncoder(nn.Module):
                 audio_signal=asr_audio_signal,
                 length=asr_length,
             )
+
+        if diar_preds is not None:
+            self._require_diar_on_asr_grid(diar_preds, asr_encoded.shape[-1])
+            if spk_targets is None:
+                spk_targets = diar_preds
+            else:
+                # Per-row substitution: keep real RTTM targets, replace only sentinel rows.
+                diar_preds = self._align_diar_frames(diar_preds, spk_targets.shape[1]).to(spk_targets.dtype)
+                spk_targets = torch.where(missing_rows.view(-1, 1, 1), diar_preds, spk_targets)
 
         if spk_targets is not None:
             outputs = self._fuse_diar_and_asr(asr_encoded, spk_targets)

@@ -987,3 +987,144 @@ def test_sentinel_rows_get_diarizer_predictions_and_others_keep_rttm():
     used = seen["targets"]
     assert torch.allclose(used[0], real, atol=1e-5), "row 0 should keep its RTTM targets"
     assert not bool((used[1] <= -1.0).all()), "row 1 should have been replaced by diarizer output"
+
+
+# ----------------------------------------------------------------------------- #
+# High-resolution diarizers on the offline path
+# ----------------------------------------------------------------------------- #
+def build_toy_high_resolution_pe_encoder() -> ParallelExpertEncoder:
+    """A PE whose diarizer predicts every 10 ms, like ``sortformer-8spk-r099`` or Nemotron-3-Diarization.
+
+    Those checkpoints set ``high_resolution: true`` and ``output_subsampling_factor: 1``. The mount
+    raises the factor to the ASR encoder's subsampling factor, so the offline path has to pool the
+    10 ms predictions onto the ASR's 80 ms grid itself.
+    """
+    diar_cfg = toy_diarization_model_cfg()
+    diar_cfg.high_resolution = True
+    diar_cfg.output_subsampling_factor = 1
+    return build_toy_pe_encoder(diarization_model_cfg=diar_cfg).eval()
+
+
+def sortformer_offline_predictions(enc, mels, length, monkeypatch):
+    """What ``SortformerEncLabelModel.forward`` returns for these mels on the PE's fusion grid.
+
+    ``forward`` starts from raw audio; its feature extraction is bypassed so that the reference
+    sees exactly the mels the PE hands its diarizer.
+    """
+    diar = enc.diarization_model
+    monkeypatch.setattr(diar, "process_signal", lambda audio_signal, audio_signal_length: (mels, length))
+    return diar.forward(audio_signal=torch.zeros(mels.shape[0], 1), audio_signal_length=length)
+
+
+def capture_fusion_targets(enc):
+    """Record the speaker activity that reaches ``_fuse_diar_and_asr``.
+
+    Compared before the fusion on purpose: ``diar_norm`` maps a thresholded row that is constant
+    across speakers to its bias, so comparing fused outputs can hide wrong speaker activity.
+    """
+    seen = {}
+    original = enc._fuse_diar_and_asr
+
+    def spy(asr_encoded, spk_targets):
+        seen["targets"] = spk_targets.detach().clone()
+        seen["asr_frames"] = asr_encoded.shape[-1]
+        return original(asr_encoded, spk_targets)
+
+    enc._fuse_diar_and_asr = spy
+    return seen
+
+
+@pytest.mark.unit
+def test_offline_splice_downsamples_high_resolution_predictions(monkeypatch):
+    """A sentinel row must be filled with the diarizer's predictions on the ASR's 80 ms grid.
+
+    Splicing a high-resolution diarizer's 10 ms predictions onto the 80 ms targets unpooled kept
+    only the first eighth of the utterance and stretched it over the whole of it.
+    """
+    enc = build_toy_high_resolution_pe_encoder()
+    seen = capture_fusion_targets(enc)
+    n_mel = 256
+    mels = torch.randn(2, _MEL_FEATURES, n_mel)
+    # Multiples of the subsampling factor, so no output frame averages a partial window.
+    length = torch.tensor([n_mel, 200])
+    n_frames = n_mel // _SUBSAMPLING_FACTOR
+    real = torch.rand(n_frames, _N_SPK)
+    targets = torch.stack([torch.full((n_frames, _N_SPK), -1.0), real])
+
+    with torch.no_grad():
+        expected = sortformer_offline_predictions(enc, mels, length, monkeypatch)
+        enc(audio_signal=mels, length=length, spk_targets=targets.clone())
+
+    used = seen["targets"]
+    assert expected.shape == (2, n_frames, _N_SPK)
+    torch.testing.assert_close(used[0], expected[0], rtol=0, atol=1e-6)
+    torch.testing.assert_close(used[1], real)
+
+
+@pytest.mark.unit
+def test_no_targets_fusion_uses_downsampled_predictions(monkeypatch):
+    """Without oracle targets, the fused activity is the diarizer's own output on the 80 ms grid."""
+    enc = build_toy_high_resolution_pe_encoder()
+    seen = capture_fusion_targets(enc)
+    mels = torch.randn(2, _MEL_FEATURES, 256)
+    length = torch.tensor([256, 200])
+
+    with torch.no_grad():
+        expected = sortformer_offline_predictions(enc, mels, length, monkeypatch)
+        enc(audio_signal=mels, length=length)
+
+    assert seen["targets"].shape[1] == seen["asr_frames"]
+    torch.testing.assert_close(seen["targets"], expected, rtol=0, atol=1e-6)
+
+
+@pytest.mark.unit
+def test_low_resolution_diarizer_offline_path_unchanged():
+    """A diarizer that already predicts on the ASR grid (like the public 4-speaker model) is fused as is."""
+    enc = build_toy_pe_encoder().eval()
+    seen = capture_fusion_targets(enc)
+    mels = torch.randn(2, _MEL_FEATURES, 256)
+    length = torch.tensor([256, 200])
+    n_frames = 256 // _SUBSAMPLING_FACTOR
+    real = torch.rand(n_frames, _N_SPK)
+    targets = torch.stack([torch.full((n_frames, _N_SPK), -1.0), real])
+
+    with torch.no_grad():
+        emb_seq, emb_seq_length = enc.diarization_model.frontend_encoder(
+            processed_signal=mels, processed_signal_length=length, bypass_pre_encode=False
+        )
+        raw = enc.diarization_model.forward_infer(emb_seq=emb_seq, emb_seq_length=emb_seq_length)
+        enc(audio_signal=mels, length=length)
+        no_targets = seen["targets"]
+        enc(audio_signal=mels, length=length, spk_targets=targets.clone())
+        spliced = seen["targets"]
+
+    assert torch.equal(no_targets, raw)
+    assert torch.equal(spliced[0], raw[0])
+    assert torch.equal(spliced[1], real)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("diar_frames, asr_frames", [(32, 32), (33, 32), (30, 32), (34, 32)])
+def test_diarizer_frames_within_tolerance_of_the_asr_grid_are_accepted(diar_frames, asr_frames):
+    """Both branches encode the same mels, so a frame or two of convolution rounding is normal."""
+    ParallelExpertEncoder._require_diar_on_asr_grid(torch.zeros(1, diar_frames, _N_SPK), asr_frames)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("diar_frames, asr_frames", [(35, 32), (29, 32), (256, 32)])
+def test_diarizer_frames_off_the_asr_grid_are_rejected(diar_frames, asr_frames):
+    with pytest.raises(ValueError, match=rf"{diar_frames} frames.*{asr_frames}"):
+        ParallelExpertEncoder._require_diar_on_asr_grid(torch.zeros(1, diar_frames, _N_SPK), asr_frames)
+
+
+@pytest.mark.unit
+def test_offline_path_rejects_unpooled_high_resolution_predictions(monkeypatch):
+    """Predictions left at 10 ms must fail loudly, not be truncated to the ASR length and fused."""
+    enc = build_toy_high_resolution_pe_encoder()
+    monkeypatch.setattr(enc, "_align_diarization_output_resolution", lambda preds, lengths: preds, raising=False)
+    mels = torch.randn(1, _MEL_FEATURES, 256)
+    length = torch.tensor([256])
+    targets = torch.full((1, 256 // _SUBSAMPLING_FACTOR, _N_SPK), -1.0)
+
+    with torch.no_grad(), pytest.raises(ValueError, match=r"256 frames.*32"):
+        enc(audio_signal=mels, length=length, spk_targets=targets)
