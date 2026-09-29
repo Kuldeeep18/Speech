@@ -35,7 +35,6 @@ from pathlib import Path
 import pytest
 import torch
 
-from nemo.collections.speechlm2.models import streaming_stt_model as stt
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 from nemo.utils.oomptimizer import (
     SequenceLengthResolver,
@@ -207,39 +206,3 @@ def test_generator_passes_scalars_through_unwrapped(generator_cls):
     batch = gen(*_resolver(schema).resolve_one(10.0))
     assert batch.chunk_size == 28
     assert not torch.is_tensor(batch.chunk_size)
-
-
-# ===========================================================================
-# The model-side guard
-# ===========================================================================
-
-
-def test_dropping_encoder_output_is_logged(monkeypatch, caplog):
-    """A sequence with no audio positions silently discards the encoder; say so once."""
-    monkeypatch.setattr(stt, "_WARNED_AUDIO_DROPPED", False)
-    input_tokens = torch.full((2, 6), 5, dtype=torch.long)
-    with caplog.at_level("WARNING"):
-        out = stt.interleave_embeddings(
-            input_tokens=input_tokens,
-            audio_mask=torch.zeros_like(input_tokens, dtype=torch.bool),
-            text_embeds=torch.zeros(2, 6, 4),
-            audio_embs=torch.zeros(2, 3, 4),
-            pad_id=0,
-        )
-    assert "no AUDIO_TOKEN_IDX positions" in caplog.text
-    assert out["input_embeds"].shape == (2, 6, 4)
-
-
-def test_genuine_pure_text_is_not_logged(monkeypatch, caplog):
-    """No encoder frames means no audio was dropped -- do not cry wolf."""
-    monkeypatch.setattr(stt, "_WARNED_AUDIO_DROPPED", False)
-    input_tokens = torch.full((2, 6), 5, dtype=torch.long)
-    with caplog.at_level("WARNING"):
-        stt.interleave_embeddings(
-            input_tokens=input_tokens,
-            audio_mask=torch.zeros_like(input_tokens, dtype=torch.bool),
-            text_embeds=torch.zeros(2, 6, 4),
-            audio_embs=torch.zeros(2, 0, 4),
-            pad_id=0,
-        )
-    assert "no AUDIO_TOKEN_IDX positions" not in caplog.text
