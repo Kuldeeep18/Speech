@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
-from lhotse import CutSet
+from lhotse import CutSet, fastcopy
 from lhotse.indexing import create_shar_index, index_exists
 from lhotse.shar.writers import SharWriter
 from lhotse.testing.dummies import DummyManifest, dummy_in_memory_features
@@ -214,8 +214,8 @@ def _write_shar(root: Path, *, create_index: bool) -> list[str]:
     return [cut.id for cut in cuts]
 
 
-def _write_field_shar(root, *, compress, audio_format, array_format):
-    root.mkdir()
+def _write_field_shar(root, *, compress, audio_format, array_format, include_cuts=True, long_ids=False):
+    root.mkdir(exist_ok=True)
     original = list(DummyManifest(CutSet, begin_id=0, end_id=4, with_data=True))
     fields = {
         "recording": audio_format,
@@ -227,15 +227,54 @@ def _write_field_shar(root, *, compress, audio_format, array_format):
         "label": "jsonl",
     }
     for cut in original:
+        if long_ids:
+            cut.id = f"nested/{cut.id}-" + "音声" * 70
         cut.features = dummy_in_memory_features(0)
         cut.label = {"id": cut.id, "languages": ["en", "ja"]}
     original[-1].features = None
     for field in fields.keys() - {"recording", "features"}:
         original[-1].custom.pop(field)
-    with SharWriter(root, fields=fields, shard_size=3, compress_jsonl=compress, create_index=False) as writer:
+    with SharWriter(
+        root, fields=fields, shard_size=3, compress_jsonl=compress, create_index=False, include_cuts=include_cuts
+    ) as writer:
         for cut in original:
             writer.write(cut)
     return writer.output_paths
+
+
+@pytest.mark.parametrize("compress", [False, True])
+def test_indexed_shar_long_unicode_cut_ids(tmp_path, compress):
+    pytest.importorskip("indexed_gzip")
+    root = tmp_path / "shar"
+    _write_field_shar(root, compress=compress, audio_format="flac", array_format="lilcom", long_ids=True)
+    create_shar_index(root)
+    expected = {cut.id: _shar_payloads(cut) for cut in CutSet.from_shar(in_dir=root, indexed=False)}
+    cuts, _ = read_cutset_from_config(
+        OmegaConf.create({"shar_path": str(root), "indexed": True, "force_finite": True, "shard_seed": 0})
+    )
+    actual = {cut.id: _shar_payloads(cut) for cut in cuts}
+    assert actual.keys() == expected.keys()
+    for cut_id in actual:
+        _assert_shar_payloads(actual[cut_id], expected[cut_id])
+
+
+@pytest.mark.parametrize("compress", [False, True])
+def test_indexed_shar_fields_added_without_rewriting_cuts(tmp_path, compress):
+    pytest.importorskip("indexed_gzip")
+    root = tmp_path / "shar"
+    root.mkdir()
+    with SharWriter(root, fields={}, shard_size=3, compress_jsonl=compress) as writer:
+        for cut in DummyManifest(CutSet, begin_id=0, end_id=4):
+            writer.write(fastcopy(cut, recording=None, features=None, custom=None))
+    _write_field_shar(root, compress=compress, audio_format="flac", array_format="lilcom", include_cuts=False)
+    create_shar_index(root)
+    expected = {cut.id: _shar_payloads(cut) for cut in CutSet.from_shar(in_dir=root, indexed=False)}
+    config = OmegaConf.create({"shar_path": str(root), "indexed": True, "force_finite": True, "shard_seed": 0})
+    actual, _ = read_cutset_from_config(config)
+    result = {cut.id: _shar_payloads(cut) for cut in actual}
+    assert result.keys() == expected.keys()
+    for cut_id in result:
+        _assert_shar_payloads(result[cut_id], expected[cut_id])
 
 
 @pytest.mark.parametrize("compress", [False, True])
