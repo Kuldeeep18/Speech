@@ -482,6 +482,33 @@ class ParallelExpertEncoderPT(ModelPT):
         return bundle.encoder
 
     @classmethod
+    def from_inline_config(
+        cls,
+        cfg: Union[DictConfig, Mapping[str, Any]],
+        *,
+        map_location: Union[str, torch.device] = 'cpu',
+    ) -> ParallelExpertEncoder:
+        """Construct the encoder architecture from an embedded bundle config, without its weights.
+
+        An HF export of a SpeechLM model stores the mounted bundle's ``model_config.yaml``, with its
+        runtime values, as ``pe_encoder_config``, and the encoder tensors in the root state dict,
+        which the caller loads after construction. The encoder class follows the loader class
+        (:class:`StreamingParallelExpertEncoderPT` builds a :class:`StreamingParallelExpertEncoder`),
+        not the config's ``target``, as in :meth:`load_from_nemo`.
+
+        Args:
+            cfg: The bundle config, e.g. ``pe_encoder_config`` of an exported model config.
+            map_location: Device to move the constructed encoder to.
+
+        Returns:
+            The constructed encoder, with freshly initialised weights.
+        """
+        cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True) if isinstance(cfg, DictConfig) else cfg)
+        cls._validate_bundle_schema(cfg)
+        shell = cls(cfg=cfg, trainer=None)
+        return shell.encoder.to(map_location)
+
+    @classmethod
     def save_to_nemo(
         cls,
         encoder: ParallelExpertEncoder,

@@ -876,6 +876,8 @@ def test_parallel_expert_encoder_cfg_keys_only_when_a_bundle_is_mounted():
     that mount runs; without a bundle, the warning is still the truth for them."""
     keys = pretrained.parallel_expert_encoder_cfg_keys(DictConfig({"pe_encoder_path": "/tmp/pe.nemo"}))
     assert {"pe_encoder_overrides", "encoder_chunk_size_seconds", "spk_kernel_scale"} <= set(keys)
+    # An HF export's embedded bundle config is mounted by the same function.
+    assert pretrained.parallel_expert_encoder_cfg_keys(DictConfig({"pe_encoder_config": {"target": "x"}})) == keys
     assert pretrained.parallel_expert_encoder_cfg_keys(DictConfig({"pe_encoder_overrides": {}})) == ()
 
 
@@ -894,3 +896,106 @@ def test_bundle_mount_class_follows_the_streaming_flag(tmp_path, cpu_default_dev
     pretrained.setup_parallel_expert_encoder(model, **kwargs)
 
     assert type(model.perception.encoder).__name__ == expected
+
+
+def _hf_export_config(model) -> dict:
+    """``examples/speechlm2/to_hf.py::_hf_export_config``; the script is loaded as ``test_to_hf.py`` does."""
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "to_hf_for_pretrained_test", Path(__file__).parents[3] / "examples" / "speechlm2" / "to_hf.py"
+    )
+    to_hf = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(to_hf)
+    return to_hf._hf_export_config(model, "float32")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [({}, "ParallelExpertEncoder"), ({"streaming": True}, "StreamingParallelExpertEncoder")],
+    ids=["default_plain", "streaming"],
+)
+def test_embedded_bundle_config_mounts_the_exported_encoder(tmp_path, cpu_default_device, kwargs, expected):
+    """An HF export replaces ``pe_encoder_path`` with ``pe_encoder_config``. Mounting that config
+    builds the same architecture, with the exported runtime values, as the class the caller asks for;
+    the exported weights then load strictly. No bundle file is needed."""
+    from tests.collections.asr.test_parallel_expert_encoder import write_toy_bundle
+
+    bundle = write_toy_bundle(tmp_path / "pe.nemo")
+    source = _pe_mount_model(
+        {
+            "pe_encoder_path": bundle,
+            "pe_encoder_overrides": {"missing_rttm_target": -2.0},
+            "encoder_chunk_size_seconds": 2.0,
+            "spk_kernel_scale": 0.5,
+            "perception": {},
+        }
+    )
+    pretrained.setup_parallel_expert_encoder(source, **kwargs)
+    exported = _hf_export_config(source)
+    assert exported["pe_encoder_path"] is None and "pe_encoder_overrides" not in exported
+    (tmp_path / "pe.nemo").unlink()
+
+    model = _pe_mount_model({**exported, "perception": {}})
+    pretrained.setup_parallel_expert_encoder(model, **kwargs)
+
+    encoder = model.perception.encoder
+    assert type(encoder).__name__ == expected
+    incompatible = encoder.load_state_dict(source.perception.encoder.state_dict(), strict=True)
+    assert not incompatible.missing_keys and not incompatible.unexpected_keys
+    assert encoder.chunk_size_seconds == 2.0
+    assert encoder.spk_kernel_scale == 0.5
+    assert encoder.missing_rttm_target == -2.0
+    assert model.perception.preprocessor.featurizer.normalize is None
+
+
+@pytest.mark.unit
+def test_embedded_bundle_config_rejects_a_second_source(tmp_path, cpu_default_device):
+    """``pe_encoder_config`` already carries the resolved values: it cannot be combined with a
+    bundle path, and ``pe_encoder_overrides`` (which only apply to a bundle path) are refused."""
+    from tests.collections.asr.test_parallel_expert_encoder import toy_bundle_config, write_toy_bundle
+
+    inline = OmegaConf.to_container(toy_bundle_config())
+    both = _pe_mount_model({"pe_encoder_path": write_toy_bundle(tmp_path / "pe.nemo"), "pe_encoder_config": inline})
+    with pytest.raises(ValueError, match="Set only one of model.pe_encoder_path"):
+        pretrained.setup_parallel_expert_encoder(both)
+
+    overridden = _pe_mount_model(
+        {"pe_encoder_config": inline, "pe_encoder_overrides": {"missing_rttm_target": -2.0}, "perception": {}}
+    )
+    with pytest.raises(ValueError, match="pe_encoder_overrides applies to model.pe_encoder_path only"):
+        pretrained.setup_parallel_expert_encoder(overridden)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("key", ["pe_encoder_path", "pe_encoder_config"])
+def test_setup_speech_encoder_mounts_either_bundle_source(key):
+    """SALM builds its perception through ``setup_speech_encoder``, which must mount the PE for an
+    exported ``pe_encoder_config`` as it does for ``pe_encoder_path``."""
+    value = "/tmp/pe.nemo" if key == "pe_encoder_path" else {"target": "ParallelExpertEncoderPT"}
+    model = SimpleNamespace(
+        cfg=DictConfig(
+            {
+                "pretrained_asr": "fake-asr",
+                key: value,
+                "perception": {
+                    "target": "nemo.collections.speechlm2.modules.perception.AudioPerceptionModule",
+                    "preprocessor": {"_target_": "fake.Preprocessor"},
+                    "encoder": {"d_model": 4},
+                    "output_dim": 1,
+                    "modality_adapter": {"output_dim": 1},
+                },
+            }
+        ),
+        llm=None,
+    )
+
+    with (
+        patch.object(pretrained, "AudioPerceptionModule"),
+        patch.object(pretrained, "setup_parallel_expert_encoder") as mount,
+    ):
+        pretrained.setup_speech_encoder(model, pretrained_weights=False)
+
+    mount.assert_called_once_with(model)

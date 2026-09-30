@@ -47,6 +47,7 @@ from nemo.collections.speechlm2.parts.mtp import (
 from nemo.collections.speechlm2.parts.multispeaker import build_speaker_tokens, maybe_init_lss_loss
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
 from nemo.collections.speechlm2.parts.pretrained import (
+    has_parallel_expert_encoder_bundle,
     load_pretrained_automodel_llm,
     maybe_load_pretrained_models,
     setup_speech_encoder,
@@ -306,7 +307,7 @@ class SALMAutomodel(LightningModule, HFHubMixin):
             yield
 
     def _warn_parallel_expert_encoder_inference_chunking(self) -> None:
-        if not self.cfg.get("pe_encoder_path", None):
+        if not has_parallel_expert_encoder_bundle(self.cfg):
             return
         if self.cfg.get("encoder_chunk_size_seconds", None) is not None:
             warnings.warn(

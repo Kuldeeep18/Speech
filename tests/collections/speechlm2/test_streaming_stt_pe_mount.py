@@ -208,6 +208,102 @@ def test_bundle_mounts_the_streaming_encoder_and_chunked_generate_runs(tmp_path,
     assert all(isinstance(text, str) for text in result.texts)
 
 
+def _load_to_hf():
+    """``examples/speechlm2/to_hf.py`` is a script, not a package; load it as ``test_to_hf.py`` does."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("to_hf_for_pe_mount_test", REPO_ROOT / "examples/speechlm2/to_hf.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.unit
+def test_bundle_hf_export_reloads_with_the_parallel_expert_encoder(tmp_path, monkeypatch):
+    """PF-7: an HF export of a bundle-mounted model replaces ``pe_encoder_path`` with the bundle's
+    architecture (``pe_encoder_config``) and relies on the root state dict for the weights. The
+    reload must rebuild the PE from that config, without the bundle file. Before the fix nothing
+    consumed ``pe_encoder_config``: the reload built the plain ``ConformerEncoder`` from
+    ``perception.encoder``, and the PE tensors were missing/unexpected keys that the hub loader's
+    default ``strict=False`` dropped silently."""
+    import os
+
+    import torch
+
+    from nemo.collections.asr.modules.parallel_expert_encoder import StreamingParallelExpertEncoder
+    from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel
+    from tests.collections.speechlm2.test_streaming_stt_dynamic_diarizer import (
+        CHUNK_SIZE,
+        _tiny_llm,
+        _unequal_length_audio,
+        make_pe_cfg,
+    )
+
+    previous = torch.get_default_device()
+    torch.set_default_device("cpu")
+    _tiny_llm(monkeypatch)
+    try:
+        bundle = _write_streaming_toy_bundle(tmp_path / "pe.nemo")
+        source = StreamingSTTModel(make_pe_cfg(pe_encoder_path=bundle, encoder_chunk_size_seconds=1.0)).eval()
+        export_config = _load_to_hf()._hf_export_config(source, "float32")
+        assert export_config["pe_encoder_path"] is None
+        assert export_config["pe_encoder_config"]["asr_encoder_cfg"]
+        source.save_pretrained(tmp_path / "hf", config=export_config)
+        os.remove(bundle)  # the export must not need the bundle
+
+        # The hub loader defaults to strict=False and discards its key lists, so compare directly.
+        lenient = StreamingSTTModel.from_pretrained(str(tmp_path / "hf")).eval()
+        assert isinstance(lenient.perception.encoder, StreamingParallelExpertEncoder), type(
+            lenient.perception.encoder
+        ).__name__
+        source_state, lenient_state = source.state_dict(), lenient.state_dict()
+        assert sorted(set(source_state) ^ set(lenient_state)) == []
+        for key, value in source_state.items():
+            assert torch.equal(lenient_state[key], value), key
+
+        reloaded = StreamingSTTModel.from_pretrained(str(tmp_path / "hf"), strict=True).eval()
+        encoder = reloaded.perception.encoder
+        assert isinstance(encoder, StreamingParallelExpertEncoder), type(encoder).__name__
+        assert encoder.chunk_size_seconds == 1.0
+        assert encoder.asr_normalize_type is None
+        assert reloaded.perception.preprocessor.featurizer.normalize is None
+
+        # Identical outputs: the offline perception forward, with and without oracle targets, and a
+        # chunked decode.
+        audios, lengths = _unequal_length_audio()
+        audio_lens = torch.tensor(lengths)
+        frames = -(-max(lengths) // 160 // 8)
+        targets = (torch.rand(len(lengths), frames, int(encoder.n_spk)) > 0.5).float()
+        with torch.no_grad():
+            for spk_targets in (None, targets):
+                expected, expected_lens = source.perception(
+                    input_signal=audios, input_signal_length=audio_lens, spk_targets=spk_targets
+                )
+                actual, actual_lens = reloaded.perception(
+                    input_signal=audios, input_signal_length=audio_lens, spk_targets=spk_targets
+                )
+                assert torch.equal(actual, expected)
+                assert torch.equal(actual_lens, expected_lens)
+            decodes = [
+                model.generate(
+                    audios=audios,
+                    audio_lens=audio_lens,
+                    system_prompt="Transcribe the audio into text.",
+                    max_new_tokens=8,
+                    chunk_size_override=CHUNK_SIZE,
+                ).texts
+                for model in (source, reloaded)
+            ]
+        assert decodes[0] == decodes[1]
+
+        # A re-export of the reloaded model writes the same architecture.
+        assert _load_to_hf()._hf_export_config(reloaded, "float32")["pe_encoder_config"] == (
+            export_config["pe_encoder_config"]
+        )
+    finally:
+        torch.set_default_device(previous)
+
+
 # ----------------------------------------------------------------------------- #
 # Speaker-count guards at construction (model <-> dataset <-> mounted PE)
 # ----------------------------------------------------------------------------- #

@@ -270,6 +270,30 @@ diarizer's streaming state would not have seen the start of the audio.
    nobody was speaking. Oracle streaming results on data that mixes cuts with and without an RTTM
    are affected on the rows without one; rerun them to compare.
 
+Exported checkpoints with a Parallel Expert Encoder
+---------------------------------------------------
+
+``streaming_stt_to_hf.py`` and ``to_hf.py`` export a model whose encoder was mounted from a bundle
+(``model.pe_encoder_path``) without the bundle file. The exported ``config.json`` sets
+``pe_encoder_path`` to ``null`` and stores the bundle's config as ``pe_encoder_config``, with the
+values the model ran with (``encoder_chunk_size_seconds``, the applied ``pe_encoder_overrides``, and
+so on) already filled in; ``model.safetensors`` holds the encoder weights. ``from_pretrained``, and
+therefore ``pretrained_name=<hf dir>``, rebuilds the encoder from ``pe_encoder_config`` and loads
+those weights: a StreamingSTT model gets the ``StreamingParallelExpertEncoder`` it decodes with, and
+a SALM model the plain ``ParallelExpertEncoder``. ``pe_encoder_overrides`` cannot be combined with
+``pe_encoder_config``; to change a value, edit ``pe_encoder_config`` itself.
+
+A model assembled from two checkpoints (``model.parallel_expert_encoder``) is exported with that
+section unchanged, so loading the export needs the same two checkpoints again.
+
+.. note::
+
+   Earlier versions of ``from_pretrained`` ignored ``pe_encoder_config``. An exported bundle model
+   reloaded with the plain ASR encoder that ``perception.encoder`` describes: no diarizer, and
+   randomly initialised encoder weights, because the default non-strict load dropped the encoder
+   tensors without an error. Decodes of such an export were not decodes of the trained model. The
+   same exports now reload with their Parallel Expert Encoder; rerun anything measured from one.
+
 Long-form audio
 ---------------
 

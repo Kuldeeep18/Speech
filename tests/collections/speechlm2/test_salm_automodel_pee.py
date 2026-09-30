@@ -437,10 +437,15 @@ def test_pee_prepare_inputs_routes_shared_chunk_size_at_the_correct_layer(
 
 
 @pytest.mark.unit
-def test_pee_generation_warns_that_outer_chunking_is_ignored(dummy_pe_encoder):
+@pytest.mark.parametrize(
+    "bundle_cfg",
+    [{"pe_encoder_path": "/tmp/pee.nemo"}, {"pe_encoder_config": {"target": "ParallelExpertEncoderPT"}}],
+    ids=["bundle_path", "hf_export_config"],
+)
+def test_pee_generation_warns_that_outer_chunking_is_ignored(dummy_pe_encoder, bundle_cfg):
     model = _make_pee_routing_test_model(
         dummy_pe_encoder,
-        cfg={"pe_encoder_path": "/tmp/pee.nemo", "encoder_chunk_size_seconds": 30.0},
+        cfg={**bundle_cfg, "encoder_chunk_size_seconds": 30.0},
     )
 
     with pytest.warns(UserWarning, match="generate ignores encoder_chunk_size_seconds"):

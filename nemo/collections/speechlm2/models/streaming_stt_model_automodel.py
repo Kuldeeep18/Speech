@@ -73,6 +73,7 @@ from nemo.collections.speechlm2.parts.automodel_lora import (
     maybe_install_lora,
 )
 from nemo.collections.speechlm2.parts.pretrained import (
+    has_parallel_expert_encoder_bundle,
     load_pretrained_automodel_llm,
     maybe_load_pretrained_models,
     parallel_expert_encoder_cfg_keys,
@@ -517,13 +518,14 @@ class StreamingSTTModelAutomodel(StreamingSTTModel):
         # class's `__init__` path, so the mount has to be repeated here -- it is NOT inherited.
         # Must run before `_apply_freeze_config` below so the PE's `apply_internal_freeze` hook is
         # applied to the mounted encoder rather than the throwaway one.
-        if self.core_cfg.pe_encoder_path and self.core_cfg.parallel_expert_encoder:
+        if has_parallel_expert_encoder_bundle(self.cfg) and self.core_cfg.parallel_expert_encoder:
             raise ValueError(
-                "Set only one of `model.pe_encoder_path` (a pre-fused bundle) and "
+                "Set only one of `model.pe_encoder_path` (a pre-fused bundle; `model.pe_encoder_config` "
+                "in an HF export) and "
                 "`model.parallel_expert_encoder` (assemble from separate ASR + diarizer "
                 "checkpoints); they build the same encoder from different sources."
             )
-        if self.core_cfg.pe_encoder_path:
+        if has_parallel_expert_encoder_bundle(self.cfg):
             # Chunked decoding needs the streaming interface, as on the two-checkpoint route.
             setup_parallel_expert_encoder(self, streaming=True)
         elif self.core_cfg.parallel_expert_encoder:

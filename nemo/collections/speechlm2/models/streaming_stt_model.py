@@ -52,6 +52,7 @@ from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.multispeaker import MultiSpeakerConfig
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
 from nemo.collections.speechlm2.parts.pretrained import (
+    has_parallel_expert_encoder_bundle,
     load_pretrained_hf,
     move_embedding,
     parallel_expert_encoder_cfg_keys,
@@ -370,6 +371,10 @@ class StreamingSTTModelConfig:
     # `pretrained_asr` path can supply (it has no diarizer, and `asr_norm`/`diar_norm` exist in no
     # ASR checkpoint). Same key and loader as SALM's `pe_encoder_path`.
     pe_encoder_path: Optional[str] = None
+    # What an HF export writes in place of `pe_encoder_path`: the bundle's config, with the exported
+    # model's runtime values applied. It rebuilds the same encoder, as the streaming class, without
+    # the bundle file; the weights come from the exported checkpoint. Set only one of the two.
+    pe_encoder_config: Optional[dict] = None
     # Alternative to `pe_encoder_path` when there is no pre-fused bundle: name the two source
     # checkpoints and assemble at construction time, so the ASR and diarizer branches can be
     # swapped independently. `{asr_model, diar_model}` (each a local .nemo OR a
@@ -505,13 +510,14 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         # --- Optional: replace the encoder with a ParallelExpertEncoder bundle ---
         # Must run before `_apply_freeze_config` so the PE's `apply_internal_freeze` hook is
         # applied to the mounted encoder rather than the throwaway one.
-        if self.core_cfg.pe_encoder_path and self.core_cfg.parallel_expert_encoder:
+        if has_parallel_expert_encoder_bundle(self.cfg) and self.core_cfg.parallel_expert_encoder:
             raise ValueError(
-                "Set only one of `model.pe_encoder_path` (a pre-fused bundle) and "
+                "Set only one of `model.pe_encoder_path` (a pre-fused bundle; `model.pe_encoder_config` "
+                "in an HF export) and "
                 "`model.parallel_expert_encoder` (assemble from separate ASR + diarizer "
                 "checkpoints); they build the same encoder from different sources."
             )
-        if self.core_cfg.pe_encoder_path:
+        if has_parallel_expert_encoder_bundle(self.cfg):
             # Chunked decoding needs the streaming interface, as on the two-checkpoint route.
             setup_parallel_expert_encoder(self, streaming=True)
         elif self.core_cfg.parallel_expert_encoder:

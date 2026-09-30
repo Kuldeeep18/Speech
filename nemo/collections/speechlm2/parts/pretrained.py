@@ -306,9 +306,9 @@ def setup_speech_encoder(model: torch.nn.Module, pretrained_weights: bool = True
             asr_sd = {("encoder_multilayer." + k if k.startswith("encoder.") else k): v for k, v in asr_sd.items()}
         model.perception.load_state_dict(asr_sd, strict=False)
 
-    if model.cfg.get("pe_encoder_path", None) not in (None, "", False):
+    if has_parallel_expert_encoder_bundle(model.cfg):
         if model.cfg.get("speaker_encoder", None) not in (None, "", False):
-            raise ValueError("pe_encoder_path and speaker_encoder are mutually exclusive.")
+            raise ValueError("pe_encoder_path (or pe_encoder_config) and speaker_encoder are mutually exclusive.")
         setup_parallel_expert_encoder(model)
     elif model.cfg.get("speaker_encoder", None) not in (None, "", False):
         setup_independent_speaker_encoder(model)
@@ -411,13 +411,24 @@ def parallel_expert_encoder_cfg_keys(cfg) -> tuple:
     ``consumed_keys`` so they are not reported as ignored. Without a bundle nothing reads them, and
     the warning stays accurate.
     """
-    if cfg.get("pe_encoder_path", None) in (None, "", False):
+    if not has_parallel_expert_encoder_bundle(cfg):
         return ()
     return PARALLEL_EXPERT_ENCODER_BUNDLE_CFG_KEYS
 
 
+def has_parallel_expert_encoder_bundle(cfg) -> bool:
+    """Whether ``cfg`` mounts a bundle PE: a ``pe_encoder_path``, or the ``pe_encoder_config`` that an
+    HF export writes in its place."""
+    return cfg.get("pe_encoder_path", None) not in (None, "", False) or cfg.get("pe_encoder_config", None) not in (
+        None,
+        {},
+        "",
+        False,
+    )
+
+
 def setup_parallel_expert_encoder(model: torch.nn.Module, *, streaming: bool = False):
-    """Mount the external perception encoder from ``model.pe_encoder_path``.
+    """Mount the external perception encoder from ``model.pe_encoder_path`` or ``model.pe_encoder_config``.
 
     This is an encoder replacement, not a training-checkpoint restore. It keeps
     the existing SALM perception path intact:
@@ -428,6 +439,11 @@ def setup_parallel_expert_encoder(model: torch.nn.Module, *, streaming: bool = F
     internally, so the outer perception preprocessor
     normalisation is disabled when the bundle is mounted.
 
+    ``model.pe_encoder_path`` loads a bundle ``.nemo`` with its weights. ``model.pe_encoder_config`` is
+    what an HF export (``examples/speechlm2/to_hf.py``) writes instead: the bundle's config, with the
+    runtime values and overrides of the exported model already applied. It builds the architecture
+    only; the weights come from the checkpoint the model is loaded from, so no bundle file is needed.
+
     Args:
         model: The model whose ``perception.encoder`` is replaced.
         streaming: Mount a :class:`StreamingParallelExpertEncoder`, for models that decode chunk by
@@ -436,34 +452,53 @@ def setup_parallel_expert_encoder(model: torch.nn.Module, *, streaming: bool = F
             (SALM) loads through :class:`ParallelExpertEncoderPT` as before, which mounts a local
             ``.nemo`` as the plain :class:`ParallelExpertEncoder`.
     """
-    pe_encoder_path = model.cfg.get("pe_encoder_path", None)
-    if pe_encoder_path in (None, "", False):
+    if not has_parallel_expert_encoder_bundle(model.cfg):
         return
+    pe_encoder_path = model.cfg.get("pe_encoder_path", None)
+    from_path = pe_encoder_path not in (None, "", False)
+    if from_path and model.cfg.get("pe_encoder_config", None) not in (None, {}, "", False):
+        raise ValueError(
+            "Set only one of model.pe_encoder_path (a bundle .nemo) and model.pe_encoder_config (the "
+            "bundle config an HF export embeds); they describe the same encoder."
+        )
+    source = pe_encoder_path if from_path else "model.pe_encoder_config"
 
     if not (hasattr(model, "perception") and model.perception is not None):
         raise RuntimeError(
-            f"model.pe_encoder_path='{pe_encoder_path}' is set but the model has no "
+            f"A ParallelExpertEncoder ({source}) is configured but the model has no "
             "`perception` module to mount it onto. Call setup_speech_encoder() first."
         )
-    if not isinstance(pe_encoder_path, str) or not pe_encoder_path:
+    if from_path and not isinstance(pe_encoder_path, str):
         raise ValueError(
             "model.pe_encoder_path must be a local ParallelExpertEncoderPT .nemo bundle path or a "
             f"pretrained model id (HuggingFace '{{repo}}/{{name}}' or NGC alias), got {pe_encoder_path!r}."
         )
     if not hasattr(model.perception, "encoder"):
         raise RuntimeError(
-            "model.pe_encoder_path requires a direct `model.perception.encoder` to replace. "
+            "A ParallelExpertEncoder requires a direct `model.perception.encoder` to replace. "
             "Adapters that wrap the encoder at construction time (for example multi-layer "
             "feature extractors) need a separate implementation."
         )
 
     loader_cls = StreamingParallelExpertEncoderPT if streaming else ParallelExpertEncoderPT
-    pe_encoder = loader_cls.load_from_nemo(
-        pe_encoder_path,
-        map_location="cpu",
-        strict=True,
-        config_overrides=model.cfg.get("pe_encoder_overrides", None),
-    )
+    if from_path:
+        pe_encoder = loader_cls.load_from_nemo(
+            pe_encoder_path,
+            map_location="cpu",
+            strict=True,
+            config_overrides=model.cfg.get("pe_encoder_overrides", None),
+        )
+    else:
+        if model.cfg.get("pe_encoder_overrides", None) not in (None, {}):
+            raise ValueError(
+                "model.pe_encoder_overrides applies to model.pe_encoder_path only. model.pe_encoder_config "
+                "already carries the values the exported model ran with; edit it directly instead."
+            )
+        pe_encoder = loader_cls.from_inline_config(model.cfg.pe_encoder_config, map_location="cpu")
+        logging.info(
+            "Built %s from model.pe_encoder_config; its weights come from the checkpoint being loaded.",
+            type(pe_encoder).__name__,
+        )
     obsolete_chunk_keys = [
         key
         for key in ("pe_asr_chunk_size_seconds", "pe_diar_chunk_size_seconds")
@@ -550,7 +585,7 @@ def setup_parallel_expert_encoder(model: torch.nn.Module, *, streaming: bool = F
         logging.warning(
             "Could not disable perception preprocessor featurizer.normalize while mounting "
             "ParallelExpertEncoder from %s.",
-            pe_encoder_path,
+            source,
         )
     try:
         with open_dict(model.cfg):
@@ -570,7 +605,7 @@ def setup_parallel_expert_encoder(model: torch.nn.Module, *, streaming: bool = F
         "Mounted ParallelExpertEncoder from %s "
         "(d_model=%d, n_spk=%d, frozen: asr=%s diar=%s, spk_kernel_scale=%g); "
         "perception preprocessor normalization disabled (was %r).",
-        pe_encoder_path,
+        source,
         int(pe_encoder.d_model),
         int(pe_encoder.n_spk),
         bool(pe_encoder.freeze_asr),

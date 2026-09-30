@@ -474,7 +474,9 @@ A ``ParallelExpertEncoder`` replaces the perception encoder, either from a self-
 (``model.pe_encoder_path``, optionally with ``model.pe_encoder_overrides``) or assembled from an ASR
 and a Sortformer checkpoint (``model.parallel_expert_encoder`` with ``asr_model``, ``diar_model``
 and any encoder constructor argument). Every applied override is logged when the encoder is
-mounted.
+mounted. An HF export replaces ``model.pe_encoder_path`` with ``model.pe_encoder_config``, the
+bundle's config with the overrides applied, which rebuilds the same encoder without the bundle
+file (see :doc:`/speechlm2/evaluation`).
 
 StreamingSTT models decode chunk by chunk, so they mount a ``StreamingParallelExpertEncoder`` on
 both routes: a bundle always mounts as the streaming class, whatever ``target`` its
