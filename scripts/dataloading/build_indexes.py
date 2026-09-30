@@ -72,6 +72,7 @@ from nemo.collections.common.data.lhotse.indexed_adapters import (
     wds_v2_metadata_path,
 )
 from nemo.collections.common.data.lhotse.nemo_adapters import expand_sharded_filepaths
+from nemo.collections.common.data.lhotse.nemo_tar_routing import _open_indexed_manifest_path
 from nemo.collections.common.data.lhotse.wds_catalog import discover_webdataset_shards
 
 # --------------------------------------------------------------------------- #
@@ -508,7 +509,6 @@ def _source_size(path: str) -> int:
 
 def _validate_legacy_sidecar(job: IndexJob) -> None:
     from lhotse.indexing import read_index
-    from lhotse.serialization import open_best
 
     idx_path = Path(job.idx_path())
     offsets = read_index(idx_path)
@@ -518,14 +518,11 @@ def _validate_legacy_sidecar(job: IndexJob) -> None:
         raise ValueError(f"Index offsets are not monotonic: {idx_path}")
     gzip_jsonl = job.kind == JSONL and job.path.endswith((".jsonl.gz", ".json.gz"))
     if gzip_jsonl:
-        from lhotse.indexing import _open_for_indexed_read, _require_indexed_gzip, gzip_index_file_path
+        from lhotse.indexing import gzip_index_file_path
 
         seek_index_path = gzip_index_file_path(job.path, index_path=idx_path)
-        with _open_for_indexed_read(job.path) as source:
-            with _require_indexed_gzip().IndexedGzipFile(fileobj=source) as reader:
-                with open_best(seek_index_path, "rb") as seek_index:
-                    reader.import_index(fileobj=seek_index)
-                source_size = reader.seek(0, os.SEEK_END)
+        with _open_indexed_manifest_path(job.path, idx_path) as source:
+            source_size = source.seek(0, os.SEEK_END)
     else:
         source_size = _source_size(job.path)
     if int(offsets[-1]) != source_size:

@@ -1040,7 +1040,8 @@ Gzip JSONL packs use format version 4. Their offsets refer to the
 uncompressed stream, and the pack embeds the companion ``.gzidx`` contents.
 Loose ``.idx`` and ``.gzidx`` files are unnecessary after conversion. Rebuild
 a gzip pack when moving its sources to different paths; catalog relocation
-does not support gzip packs.
+does not support gzip packs. Native tar route reuse accepts authenticated
+version 3 and version 4 packs, including embedded gzip seek data.
 
 Build loose sidecars first, then convert each independently configured dataset
 to its own pack. Most sidecars are copied directly. For paired native NeMo

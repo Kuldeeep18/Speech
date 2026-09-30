@@ -110,9 +110,10 @@ def _make_native_tar_dataset(tmp_path):
     return tar_path, idx_path, input_cfg
 
 
-def _make_native_tar_routing_dataset(tmp_path, rows, members, *, tar_format=None):
-    manifest = tmp_path / "manifest.jsonl"
-    manifest.write_text("".join(json.dumps(row) + "\n" for row in rows))
+def _make_native_tar_routing_dataset(tmp_path, rows, members, *, tar_format=None, compress_jsonl=False):
+    manifest = tmp_path / ("manifest.jsonl.gz" if compress_jsonl else "manifest.jsonl")
+    content = "".join(json.dumps(row) + "\n" for row in rows).encode("utf-8")
+    manifest.write_bytes(gzip.compress(content) if compress_jsonl else content)
     create_jsonl_index(manifest)
 
     tar_path = tmp_path / "audio.tar"
@@ -482,6 +483,12 @@ def test_idxpack_json_record_validator_reuses_one_remote_reader_per_shard(tmp_pa
     assert summary.records_checked == 2
     assert opens == [remote_manifest]
 
+    opens.clear()
+    with IndexPack(pack_path) as pack:
+        rows = list(converter._iter_packed_manifest_shard_rows(pack.collection(spec.key), 0))
+    assert rows == [{"id": "one"}, {"id": "two"}]
+    assert opens == [remote_manifest]
+
 
 def test_converter_does_not_publish_pack_with_malformed_json_records(tmp_path):
     manifest, _ = _make_malformed_jsonl_pack(tmp_path)
@@ -699,7 +706,12 @@ def _native_tar_route_reuse_args(source_cfg: Path, source_pack: Path) -> list[st
     ]
 
 
-def test_converter_reuses_authenticated_route_when_only_nonrouting_fields_change(tmp_path, monkeypatch):
+@pytest.mark.parametrize("compress_jsonl", [False, True])
+def test_converter_reuses_authenticated_route_when_only_nonrouting_fields_change(
+    tmp_path, monkeypatch, compress_jsonl
+):
+    if compress_jsonl:
+        pytest.importorskip("indexed_gzip")
     source_root = tmp_path / "source"
     source_root.mkdir()
     source_manifest, tar_path, source_cfg = _make_native_tar_routing_dataset(
@@ -709,10 +721,15 @@ def test_converter_reuses_authenticated_route_when_only_nonrouting_fields_change
             for name in ("C.wav", "A.wav", "D.wav", "B.wav")
         ],
         [(f"{name}.wav", name.encode()) for name in "ABCD"],
+        compress_jsonl=compress_jsonl,
     )
     source_pack = tmp_path / "source.idxpack"
     source_result = CliRunner().invoke(main, ["--output", str(source_pack), str(source_cfg)])
     assert source_result.exit_code == 0, source_result.output
+    if compress_jsonl:
+        # Reuse reads gzip seek data from the authenticated pack alone.
+        Path(f"{source_manifest}.idx").unlink()
+        Path(f"{source_manifest}.gzidx").unlink()
 
     target_manifest = tmp_path / "target-manifest.jsonl"
     target_manifest.write_text(
@@ -730,6 +747,10 @@ def test_converter_reuses_authenticated_route_when_only_nonrouting_fields_change
             for name in ("C.wav", "A.wav", "D.wav", "B.wav")
         )
     )
+    if compress_jsonl:
+        compressed = target_manifest.with_suffix(".jsonl.gz")
+        compressed.write_bytes(gzip.compress(target_manifest.read_bytes()))
+        target_manifest = compressed
     create_jsonl_index(target_manifest)
     target_cfg = tmp_path / "target.yaml"
     target_cfg.write_text(

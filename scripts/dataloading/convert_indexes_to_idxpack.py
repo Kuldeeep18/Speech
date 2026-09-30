@@ -660,7 +660,7 @@ def _authenticate_native_tar_route_source_pack(
     source_routes: Sequence[NativeTarOrdinalMapSpec],
     expected_sha256: str,
 ) -> None:
-    """Authenticate a v3 source pack and validate its complete collection schema."""
+    """Authenticate a source pack with route arrays and validate its collection schema."""
     _validate_source_pack_digest(source_pack, expected_sha256)
     expected_keys = _expected_source_pack_keys(source_collections, source_routes)
     actual_keys = set(source_pack._collections)
@@ -670,8 +670,10 @@ def _authenticate_native_tar_route_source_pack(
             f"expected_collections={len(expected_keys)}, actual_collections={len(actual_keys)}, "
             f"missing={len(set(expected_keys) - actual_keys)}, unexpected={len(actual_keys - set(expected_keys))}"
         )
-    if source_pack.version != 3:
-        raise ValueError(f"Native-tar route reuse requires a version-3 source pack, got version {source_pack.version}")
+    if source_pack.version not in (3, 4):
+        raise ValueError(
+            f"Native-tar route reuse requires a version-3 or version-4 source pack, got version {source_pack.version}"
+        )
     for spec in source_collections:
         _validate_source_pack_collection(source_pack, spec)
     for spec in source_routes:
@@ -1962,7 +1964,7 @@ def _merge_native_tar_route_arrays(
     "--reuse-native-tar-routes-source-pack",
     type=click.Path(exists=True, dir_okay=False),
     default=None,
-    help="Authenticated version-3 idxpack built from the route-reuse source input_cfg.",
+    help="Authenticated version-3 or version-4 idxpack built from the route-reuse source input_cfg.",
 )
 @click.option(
     "--reuse-native-tar-routes-source-pack-sha256",

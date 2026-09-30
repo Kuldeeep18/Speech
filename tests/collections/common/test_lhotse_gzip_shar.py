@@ -3,6 +3,7 @@
 
 """Compressed Shar coverage through NeMo's index builder and dataloader."""
 
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -28,18 +29,7 @@ class _Identity(torch.utils.data.Dataset):
 def gzip_shar(tmp_path):
     pytest.importorskip("indexed_gzip")
     root = tmp_path / "shar"
-    root.mkdir()
-    cuts = DummyManifest(CutSet, begin_id=0, end_id=8, with_data=True)
-    for cut in cuts:
-        cut.features = None
-        cut.custom = None
-        cut.supervisions[0].custom = None
-    with SharWriter(
-        root, fields={"recording": "wav"}, shard_size=3, compress_jsonl=True, create_index=False
-    ) as writer:
-        for cut in cuts:
-            writer.write(cut)
-    return root, [cut.id for cut in cuts]
+    return root, _write_shar(root, create_index=False)
 
 
 def _fields(root: Path) -> dict[str, list[str]]:
@@ -134,3 +124,72 @@ def test_gzip_shar_exact_restore_through_nemo_config(gzip_shar):
     restored, _ = read_cutset_from_config(config)
     restored.load_state_dict(state)
     assert consumed + [cut.id for cut in restored] == expected_order
+
+
+@pytest.mark.parametrize("num_workers", [0, 2])
+def test_automatically_indexed_gzip_shar_stateful_dataloader_resume(tmp_path, num_workers):
+    pytest.importorskip("torchdata.stateful_dataloader")
+    pytest.importorskip("indexed_gzip")
+    indexed_root = tmp_path / "auto-indexed"
+    expected_ids = _write_shar(indexed_root, create_index=True)
+    assert all(index_exists(path) for path in indexed_root.glob("cuts.*.jsonl.gz"))
+    config = OmegaConf.create(
+        {
+            "shar_path": str(indexed_root),
+            "indexed": True,
+            "use_stateful_dataloader": True,
+            "force_map_dataset": False,
+            "force_finite": True,
+            "shuffle": True,
+            "shard_seed": 23,
+            "seed": 23,
+            "sample_rate": 16000,
+            "batch_size": 2,
+            "num_workers": num_workers,
+            "drop_last": False,
+        }
+    )
+
+    def make_loader():
+        return get_lhotse_dataloader_from_config(config=config, global_rank=0, world_size=1, dataset=_Identity())
+
+    def batch_ids(batches):
+        return [[cut.id for cut in batch] for batch in batches]
+
+    loaders = []
+    try:
+        full = make_loader()
+        loaders.append(full)
+        expected = batch_ids(full)
+        assert sorted(cut_id for batch in expected for cut_id in batch) == sorted(expected_ids)
+        partial = make_loader()
+        loaders.append(partial)
+        iterator = iter(partial)
+        first = next(iterator)
+        assert isinstance(first[0].load_audio(), np.ndarray)
+        prefix = batch_ids([first])
+        state = deepcopy(partial.state_dict())
+        resumed = make_loader()
+        loaders.append(resumed)
+        resumed.load_state_dict(state)
+        assert prefix + batch_ids(resumed) == expected
+    finally:
+        for loader in loaders:
+            iterator = getattr(loader, "_iterator", None)
+            if num_workers and iterator is not None:
+                iterator._shutdown_workers()
+
+
+def _write_shar(root: Path, *, create_index: bool) -> list[str]:
+    root.mkdir()
+    cuts = DummyManifest(CutSet, begin_id=0, end_id=8, with_data=True)
+    for cut in cuts:
+        cut.features = None
+        cut.custom = None
+        cut.supervisions[0].custom = None
+    with SharWriter(
+        root, fields={"recording": "wav"}, shard_size=3, compress_jsonl=True, create_index=create_index
+    ) as writer:
+        for cut in cuts:
+            writer.write(cut)
+    return [cut.id for cut in cuts]
