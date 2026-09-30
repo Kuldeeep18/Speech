@@ -966,8 +966,8 @@ The following ``input_cfg`` types accept ``indexed: true`` today and require an
 * ``nemo`` / ``nemo_tarred`` — JSONL manifest gets ``manifest.json.idx``;
   every audio tar in ``tarred_audio_filepaths`` gets ``shard.tar.idx``.
 * ``lhotse`` (plain) — ``cuts.jsonl`` gets ``cuts.jsonl.idx``.
-* ``lhotse_shar`` — every uncompressed ``cuts.<NNNNNN>.jsonl`` and field tar
-  inside the Shar dir.
+* ``lhotse_shar`` — every plain or gzip cuts shard, custom JSONL field shard,
+  and uncompressed field tar inside the Shar dir.
 * ``parquet`` — no sidecar required, but the file must expose row-group
   statistics (the default for files written by pyarrow / pandas).
 * ``txt_jsonl`` — every file in ``paths``.
@@ -983,9 +983,12 @@ Two caveats to be aware of:
   on ``nemo``/``nemo_tarred``: those features mutate or expand cuts in a way
   that has no stable index. Pre-process the manifest offline if you need them
   in an indexed pipeline.
-* Only **uncompressed** files can be indexed (no ``.jsonl.gz``,
-  ``.tar.gz``, etc.) and only files on a backend that supports indexed reads
-  (local FS, S3-compatible object stores, AIStore).
+* Plain JSONL and gzip JSONL (``.jsonl.gz`` or line-delimited ``.json.gz``)
+  can be indexed. Gzip requires ``lhotse[gzip]`` and both ``.idx`` and
+  ``.gzidx`` sidecars. Tar shards must be uncompressed. Indexed sources
+  require a backend that supports seekable reads, such as local files or
+  AIStore's byte-range reader. Other manifest compression remains available
+  through streaming loading.
 
 Lazy URL-backed ``nemo_tarred`` rows (indexed loading and AIS GetBatch) must
 also provide trusted source sampling-rate metadata.  Put ``sampling_rate`` (or
@@ -1024,6 +1027,13 @@ Two equivalent ways:
    placing them next to the data — see :ref:`lhotse-indexes-root` below.
    Gzip JSONL requires Lhotse's optional ``indexed_gzip`` dependency and
    creates both ``<source>.idx`` and ``<source>.gzidx`` in that location.
+
+Lhotse Shar writers create indexes for finalized shards automatically with
+``create_index=True``. Gzip indexing requires ``lhotse[gzip]``; failures emit
+warnings while preserving the written shards. For existing Shar data, the
+batch helper discovers both gzip cuts and custom JSONL fields. AIStore sources
+can retain their object URLs with sidecars stored under ``--indexes-root``.
+Configured local source mirrors also apply when validating gzip manifests.
 
 Packing sidecars into dataset-level ``.idxpack`` files
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

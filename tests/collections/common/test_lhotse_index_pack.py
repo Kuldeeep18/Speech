@@ -83,6 +83,42 @@ def test_gzip_jsonl_idxpack_build_and_validation(tmp_path):
     assert "records_checked=4" in result.output
 
 
+def test_converter_rejects_truncated_gzip_sidecar(tmp_path):
+    pytest.importorskip("indexed_gzip")
+    manifest = tmp_path / "records.jsonl.gz"
+    first = b'{"text": "first"}\n'
+    manifest.write_bytes(gzip.compress(first + b'{"text": "second"}\n'))
+    index = create_jsonl_index(manifest)
+    Path(index).write_bytes(struct.pack("<QQ", 0, len(first)))
+    config = tmp_path / "dataset.yaml"
+    config.write_text(yaml.safe_dump([{"type": "materialized_sft_messages", "paths": [str(manifest)]}]))
+    target = tmp_path / "records.idxpack"
+    result = CliRunner().invoke(main, ["--output", str(target), str(config)])
+    assert result.exit_code != 0
+    assert not target.exists()
+
+
+def test_gzip_manifest_routing_and_validation_use_s3_mirror(tmp_path, monkeypatch):
+    pytest.importorskip("indexed_gzip")
+    mirror = tmp_path / "source-mirror"
+    manifest = mirror / "bucket" / "records.jsonl.gz"
+    manifest.parent.mkdir(parents=True)
+    records = [{"id": 0}, {"id": 1}]
+    manifest.write_bytes(gzip.compress(b"".join(json.dumps(row).encode() + b"\n" for row in records)))
+    remote = "s3://bucket/records.jsonl.gz"
+    indexes_root = tmp_path / "indexes"
+    job = build_indexes.IndexJob(remote, build_indexes.JSONL, str(indexes_root))
+    create_jsonl_index(manifest, output_path=job.idx_path())
+    monkeypatch.setenv("LHOTSE_S3_LOCAL_MIRROR_ROOTS", str(mirror))
+
+    def reject_remote(*args, **kwargs):
+        raise AssertionError("Mirrored gzip sources must be opened locally")
+
+    monkeypatch.setattr("lhotse.ais.AISRangeReader", reject_remote)
+    assert list(nemo_tar_routing._iter_indexed_manifest_rows(remote, job.idx_path())) == records
+    assert build_indexes._is_indexed(job)
+
+
 def _make_native_tar_dataset(tmp_path):
     manifest = tmp_path / "manifest.jsonl"
     manifest.write_text(json.dumps({"audio_filepath": "sample.wav"}) + "\n")

@@ -625,9 +625,9 @@ def _write_nemo_tar_ordinal_map_shard_task(
 @contextmanager
 def _open_indexed_manifest_path(path: str, index_path: str | Path):
     if path.endswith((".jsonl.gz", ".json.gz")):
-        from lhotse.indexing import _open_for_indexed_read, _require_indexed_gzip, gzip_index_file_path
+        from lhotse.indexing import _require_indexed_gzip, gzip_index_file_path
 
-        with _open_for_indexed_read(path) as source:
+        with _open_data_path(path) as source:
             with _require_indexed_gzip().IndexedGzipFile(fileobj=source) as reader:
                 with open_best(gzip_index_file_path(path, index_path=index_path), "rb") as seek_index:
                     reader.import_index(fileobj=seek_index)

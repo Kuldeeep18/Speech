@@ -554,7 +554,7 @@ def read_share_gpt_webdataset_as_conversation(config) -> tuple[CutSet, bool]:
 def _resolve_shar_inputs(path: Union[str, Path], only_metadata: bool) -> dict:
     if only_metadata:
         return dict(
-            fields={"cuts": sorted(p for p in Path(path).glob("cuts.*") if p.name.endswith((".jsonl", ".jsonl.gz")))}
+            fields={"cuts": sorted(p for p in Path(path).glob("cuts.*") if not p.name.endswith((".idx", ".gzidx")))}
         )
     else:
         return dict(in_dir=path)

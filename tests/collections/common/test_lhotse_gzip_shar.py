@@ -3,8 +3,12 @@
 
 """Compressed Shar coverage through NeMo's index builder and dataloader."""
 
+import bz2
+import io
+import json
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -12,8 +16,9 @@ import torch
 from lhotse import CutSet
 from lhotse.indexing import create_shar_index, index_exists
 from lhotse.shar.writers import SharWriter
-from lhotse.testing.dummies import DummyManifest
+from lhotse.testing.dummies import DummyManifest, dummy_in_memory_features
 from omegaconf import OmegaConf
+from packaging.version import parse as parse_version
 from scripts.dataloading import build_indexes
 
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
@@ -109,6 +114,20 @@ def test_gzip_shar_metadata_only_excludes_sidecars(gzip_shar):
     assert sorted(cut.id for cut in cuts) == sorted(expected_ids)
 
 
+def test_streaming_shar_metadata_only_preserves_bzip2(tmp_path):
+    expected = list(DummyManifest(CutSet, begin_id=0, end_id=2))
+    path = tmp_path / "cuts.000000.jsonl.bz2"
+    content = b"".join(json.dumps(cut.to_dict()).encode() + b"\n" for cut in expected)
+    path.write_bytes(bz2.compress(content))
+    Path(f"{path}.idx").write_bytes(b"ignored sidecar")
+    Path(f"{path}.gzidx").write_bytes(b"ignored sidecar")
+    config = OmegaConf.create(
+        {"shar_path": str(tmp_path), "indexed": False, "metadata_only": True, "force_finite": True, "shard_seed": 0}
+    )
+    cuts, _ = read_cutset_from_config(config)
+    assert [cut.id for cut in cuts] == [cut.id for cut in expected]
+
+
 def test_gzip_shar_exact_restore_through_nemo_config(gzip_shar):
     root, expected_ids = gzip_shar
     create_shar_index(root)
@@ -193,3 +212,183 @@ def _write_shar(root: Path, *, create_index: bool) -> list[str]:
         for cut in cuts:
             writer.write(cut)
     return [cut.id for cut in cuts]
+
+
+def _write_field_shar(root, *, compress, audio_format, array_format):
+    root.mkdir()
+    original = list(DummyManifest(CutSet, begin_id=0, end_id=4, with_data=True))
+    fields = {
+        "recording": audio_format,
+        "features": array_format,
+        "custom_embedding": array_format,
+        "custom_features": array_format,
+        "custom_indexes": "numpy",
+        "custom_recording": audio_format,
+        "label": "jsonl",
+    }
+    for cut in original:
+        cut.features = dummy_in_memory_features(0)
+        cut.label = {"id": cut.id, "languages": ["en", "ja"]}
+    original[-1].features = None
+    for field in fields.keys() - {"recording", "features"}:
+        original[-1].custom.pop(field)
+    with SharWriter(root, fields=fields, shard_size=3, compress_jsonl=compress, create_index=False) as writer:
+        for cut in original:
+            writer.write(cut)
+    return writer.output_paths
+
+
+@pytest.mark.parametrize("compress", [False, True])
+@pytest.mark.parametrize("array_format", ["numpy", "lilcom"])
+@pytest.mark.parametrize("audio_format", ["wav", "flac", "mp3", "opus", "original"])
+def test_shar_all_field_formats_through_nemo(tmp_path, compress, array_format, audio_format):
+    pytest.importorskip("indexed_gzip")
+    if array_format == "lilcom":
+        pytest.importorskip("lilcom")
+    root = tmp_path / "shar"
+    paths = _write_field_shar(root, compress=compress, audio_format=audio_format, array_format=array_format)
+    mirror = tmp_path / "mirror"
+    jobs = []
+    build_indexes.discover({"type": "lhotse_shar", "shar_path": paths}, jobs, str(mirror))
+    assert len(jobs) == 16
+    for job in jobs:
+        build_indexes._build_one(job)
+        assert build_indexes._is_indexed(job)
+    assert bool(list(mirror.rglob("*.gzidx"))) == compress
+    # Directory and explicit field declarations must produce identical payloads.
+    reference, _ = read_cutset_from_config(
+        OmegaConf.create({"shar_path": str(root), "indexed": False, "force_finite": True, "shard_seed": 0})
+    )
+    expected = {cut.id: _shar_payloads(cut) for cut in reference}
+    for declaration in (str(root), paths):
+        config = OmegaConf.create(
+            {
+                "shar_path": declaration,
+                "indexed": True,
+                "indexes_root": str(mirror),
+                "force_finite": True,
+                "shard_seed": 0,
+                "shuffle": False,
+                "sample_rate": 16000,
+                "batch_size": 2,
+                "num_workers": 0,
+                "drop_last": False,
+            }
+        )
+        cuts, _ = read_cutset_from_config(config)
+        for cut in cuts:
+            _assert_shar_payloads(_shar_payloads(cut), expected[cut.id])
+        loader = get_lhotse_dataloader_from_config(config=config, global_rank=0, world_size=1, dataset=_Identity())
+        actual = {cut.id: _shar_payloads(cut) for batch in loader for cut in batch}
+        assert actual.keys() == expected.keys()
+        for cut_id in expected:
+            # The dataloader's existing resampling transform drops precomputed features.
+            loader_expected = {field: value for field, value in expected[cut_id].items() if field != "features"}
+            _assert_shar_payloads(actual[cut_id], loader_expected)
+
+
+def _shar_payloads(cut):
+    result = {"recording": cut.resample(16000).load_audio()}
+    if cut.has_features:
+        result["features"] = cut.load_features()
+    for field in ("custom_embedding", "custom_features", "custom_indexes"):
+        if cut.has_custom(field):
+            result[field] = cut.load_custom(field)
+    if cut.has_custom("custom_recording"):
+        result["custom_recording"] = cut.custom_recording.resample(16000).load_audio()
+    if cut.has_custom("label"):
+        result["label"] = cut.label
+    return result
+
+
+def _assert_shar_payloads(actual, expected):
+    assert actual.keys() == expected.keys()
+    for field in expected:
+        if field == "label":
+            assert actual[field] == expected[field]
+        else:
+            np.testing.assert_allclose(actual[field], expected[field], atol=1e-6)
+
+
+@pytest.mark.parametrize("compress", [False, True])
+@pytest.mark.parametrize("seekable", [False, True])
+def test_shar_ais_index_builder_and_loading(tmp_path, monkeypatch, compress, seekable):
+    """Exercise real AISRangeReader and AIStoreIOBackend with fake SDK transport."""
+    pytest.importorskip("indexed_gzip")
+    from lhotse.serialization import AIStoreIOBackend, BuiltinIOBackend, CompositeIOBackend, GzipIOBackend
+
+    root = tmp_path / "shar"
+    paths = _write_field_shar(root, compress=compress, audio_format="flac", array_format="lilcom")
+    reference = CutSet.from_shar(in_dir=root, indexed=False)
+    expected = {cut.id: _shar_payloads(cut) for cut in reference}
+    objects = {}
+    requests = []
+
+    class ReadStream(io.BufferedIOBase):
+        def __init__(self, payload):
+            self.payload = io.BytesIO(payload)
+
+        def read(self, size=-1):
+            return self.payload.read(size)
+
+        def readable(self):
+            return True
+
+    read_stream = io.BytesIO if seekable else ReadStream
+
+    class Object:
+        def __init__(self, url):
+            self.url = url
+
+        @property
+        def props(self):
+            return SimpleNamespace(size=len(objects[self.url]))
+
+        def get_reader(self, byte_range=None):
+            payload = objects[self.url]
+            requests.append((self.url, byte_range))
+            if byte_range is not None:
+                start, end = map(int, byte_range.removeprefix("bytes=").split("-"))
+                assert 0 <= start <= end < len(payload)
+                payload = payload[start : end + 1]
+            return SimpleNamespace(as_file=lambda: read_stream(payload), read_all=lambda: payload)
+
+    client = SimpleNamespace(get_object_from_url=Object)
+    monkeypatch.setattr("lhotse.serialization.get_aistore_client", lambda: (client, parse_version("1.10.0")))
+    monkeypatch.setattr(
+        "lhotse.serialization.CURRENT_IO_BACKEND",
+        CompositeIOBackend([GzipIOBackend(), AIStoreIOBackend(), BuiltinIOBackend()]),
+    )
+    remote_fields = {}
+    for field, shards in paths.items():
+        remote_fields[field] = []
+        for path in shards:
+            url = f"ais://bucket/shar/{Path(path).name}"
+            objects[url] = Path(path).read_bytes()
+            remote_fields[field].append(url)
+    mirror = tmp_path / "mirror"
+    jobs = []
+    build_indexes.discover({"type": "lhotse_shar", "shar_path": remote_fields}, jobs, str(mirror))
+    assert len(jobs) == 16
+    for job in jobs:
+        build_indexes._build_one(job)
+        assert build_indexes._is_indexed(job)
+    requests.clear()
+    config = OmegaConf.create(
+        {
+            "shar_path": remote_fields,
+            "indexed": True,
+            "indexes_root": str(mirror),
+            "force_finite": True,
+            "shard_seed": 0,
+        }
+    )
+    actual, _ = read_cutset_from_config(config)
+    result = {cut.id: _shar_payloads(cut) for cut in actual}
+    assert result.keys() == expected.keys()
+    for cut_id in result:
+        _assert_shar_payloads(result[cut_id], expected[cut_id])
+    assert any(url.endswith(".tar") and range_ for url, range_ in requests)
+    assert any(url.endswith(".jsonl.gz") and range_ for url, range_ in requests) == compress
+    assert bool(list(mirror.rglob("*.gzidx"))) == compress
+    assert not any(url.endswith((".idx", ".gzidx")) for url in objects)
