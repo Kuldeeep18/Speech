@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -772,6 +773,83 @@ def test_two_checkpoint_mount_honours_sync_flag(monkeypatch, cpu_default_device,
     pretrained.setup_parallel_expert_encoder_from_checkpoints(model)
 
     assert _branch_sync_flags(model) == expected
+
+
+def _toy_branch_sources(checkpoint_normalize) -> dict:
+    """``_resolve_branch_source`` results for a toy ASR + diarizer pair; the ASR config states
+    ``preprocessor.normalize: checkpoint_normalize``."""
+    from tests.collections.asr.test_parallel_expert_encoder import toy_diarization_model_cfg
+    from tests.collections.asr.test_parallel_expert_encoder_streaming import (
+        build_toy_streaming_pe_encoder,
+        streaming_asr_encoder_cfg,
+    )
+
+    source = build_toy_streaming_pe_encoder()
+    asr_cfg = {
+        "encoder": OmegaConf.to_container(streaming_asr_encoder_cfg()),
+        "preprocessor": {"normalize": checkpoint_normalize},
+    }
+    return {
+        "toy/asr": (asr_cfg, {f"encoder.{k}": v for k, v in source.asr_encoder.state_dict().items()}),
+        "toy/diar": (OmegaConf.to_container(toy_diarization_model_cfg()), source.diarization_model.state_dict()),
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "checkpoint_normalize, persisted, effective", [("NA", "NA", None), ("per_feature", "per_feature", "per_feature")]
+)
+def test_two_checkpoint_mount_persists_resolved_auto_normalization(
+    monkeypatch, cpu_default_device, checkpoint_normalize, persisted, effective
+):
+    """`asr_normalize_type: auto` is resolved once, at mount, and the resolved value replaces `auto`
+    in `model.cfg` (HF export) and in the saved hyperparameters (`.ckpt`). A reload therefore
+    builds the same encoder even if the ASR checkpoint's preprocessor changes later."""
+    import nemo.collections.asr.modules.parallel_expert_encoder as pe_module
+
+    sources = _toy_branch_sources(checkpoint_normalize)
+    monkeypatch.setattr(pe_module, "_resolve_branch_source", lambda name, model_cls, map_location: sources[name])
+    cfg = {
+        "parallel_expert_encoder": {"asr_model": "toy/asr", "diar_model": "toy/diar", "asr_normalize_type": "auto"},
+        "perception": _perception_cfg(None),
+    }
+    caller_cfg = copy.deepcopy(cfg)
+    model = _pe_mount_model(cfg)
+    # Lightning's `save_hyperparameters()` keeps the caller's own `cfg` object.
+    model.hparams = {"cfg": caller_cfg}
+
+    pretrained.setup_parallel_expert_encoder_from_checkpoints(model)
+
+    assert model.perception.encoder.asr_normalize_type == effective
+    assert model.cfg.parallel_expert_encoder.asr_normalize_type == persisted
+    assert model.hparams["cfg"]["parallel_expert_encoder"]["asr_normalize_type"] == persisted
+    assert caller_cfg["parallel_expert_encoder"]["asr_normalize_type"] == "auto", "the caller's config was edited"
+
+    # Reload from the saved hyperparameters after the checkpoint changed its mind.
+    sources["toy/asr"][0]["preprocessor"]["normalize"] = "all_features"
+    reloaded = _pe_mount_model(model.hparams["cfg"])
+    pretrained.setup_parallel_expert_encoder_from_checkpoints(reloaded)
+    assert reloaded.perception.encoder.asr_normalize_type == effective
+
+
+@pytest.mark.unit
+def test_two_checkpoint_mount_leaves_an_absent_normalization_key_absent(monkeypatch, cpu_default_device):
+    """Compatibility: an absent key still means `per_feature` and is not written back."""
+    import nemo.collections.asr.modules.parallel_expert_encoder as pe_module
+
+    sources = _toy_branch_sources("NA")
+    monkeypatch.setattr(pe_module, "_resolve_branch_source", lambda name, model_cls, map_location: sources[name])
+    model = _pe_mount_model(
+        {
+            "parallel_expert_encoder": {"asr_model": "toy/asr", "diar_model": "toy/diar"},
+            "perception": _perception_cfg(None),
+        }
+    )
+
+    pretrained.setup_parallel_expert_encoder_from_checkpoints(model)
+
+    assert model.perception.encoder.asr_normalize_type == "per_feature"
+    assert "asr_normalize_type" not in model.cfg.parallel_expert_encoder
 
 
 @pytest.mark.unit

@@ -108,6 +108,12 @@ def _clone_config(config: Optional[DictConfig]) -> Optional[DictConfig]:
 # already `normalize: NA` must not be normalized twice).
 _NORMALIZE_UNSET = object()
 
+# `asr_normalize_type: auto` asks `from_checkpoints` to replay the ASR checkpoint's own preprocessor
+# `normalize` instead of the `per_feature` default. Only that route has the ASR preprocessor config,
+# so the constructor refuses the value. These are the checkpoint values it can follow.
+_NORMALIZE_AUTO = 'auto'
+_NORMALIZE_AUTO_FOLLOWED = ('per_feature', 'all_features')
+
 # The Sortformer branch is frozen during SpeechLM training, so its streaming knobs should stay
 # exactly as its checkpoint was trained with unless a caller deliberately overrides them. The
 # previous defaults (fifo 40 / update 300 / cache 188) came from the placeholder bundle's model
@@ -562,7 +568,8 @@ class ParallelExpertEncoder(nn.Module):
         diarization_model_cfg (DictConfig): Inline config for the :class:`SortformerEncLabelModel`.
         asr_normalize_type (str, optional): Normalization replayed on the ASR branch. Defaults to
             ``per_feature`` when unset; pass ``None`` or ``'NA'`` to disable it entirely (required
-            for ASR branches whose own preprocessor already uses ``normalize: NA``).
+            for ASR branches whose own preprocessor already uses ``normalize: NA``). ``'auto'`` is
+            resolved by :meth:`from_checkpoints` only and is rejected here.
         freeze_diar (bool): Freeze the Sortformer parameters. Defaults to ``True``.
         freeze_asr (bool): Freeze the wrapped ASR ConformerEncoder. Defaults to ``False``.
         online_inference_length (int): Online-inference window in encoder output frames
@@ -629,6 +636,12 @@ class ParallelExpertEncoder(nn.Module):
         _require_asr_encoder_interface(self.asr_encoder)
         if asr_normalize_type is _NORMALIZE_UNSET:
             asr_normalize_type = 'per_feature'
+        elif isinstance(asr_normalize_type, str) and asr_normalize_type == _NORMALIZE_AUTO:
+            raise ValueError(
+                "asr_normalize_type='auto' follows the ASR checkpoint's preprocessor, so only "
+                "ParallelExpertEncoder.from_checkpoints (model.parallel_expert_encoder) resolves it. "
+                "Set an explicit value here: 'per_feature', 'all_features', or null/'NA' for none."
+            )
         self.asr_normalize_type = None if asr_normalize_type in (None, 'NA') else asr_normalize_type
         self._feat_in = self.asr_encoder._feat_in
 
@@ -756,6 +769,15 @@ class ParallelExpertEncoder(nn.Module):
         the feature dim -- so a freshly assembled encoder does not reproduce the standalone ASR
         encoder's activations. Those two norms are part of what the fusion has to learn.
 
+        ASR normalization: the ASR branch receives un-normalized mels and replays
+        ``asr_normalize_type`` itself. An absent ``asr_normalize_type`` keeps the historical
+        ``per_feature`` and logs a warning, because it ignores the ASR checkpoint's own
+        ``preprocessor.normalize`` (a checkpoint trained with ``normalize: NA`` is then fed
+        re-normalized mels). ``asr_normalize_type='auto'`` follows that checkpoint value instead:
+        ``NA``/``null`` disables the replay, and ``per_feature``/``all_features`` are replayed as
+        given. Any other checkpoint value, or none, raises. The resolved value is the encoder's
+        ``asr_normalize_type`` attribute.
+
         Each source may be a local ``.nemo`` path or a pretrained model id (a HuggingFace Hub
         ``{repo}/{name}`` or an NGC alias), resolved the same way :meth:`load_from_nemo` resolves
         bundles. Local files are read straight out of the archive; ids go through the model class's
@@ -765,7 +787,8 @@ class ParallelExpertEncoder(nn.Module):
             asr_model (str): Local ``.nemo`` path or pretrained id for the ASR branch.
             diar_model (str): Local ``.nemo`` path or pretrained id for the speaker branch.
             map_location: Device to map the loaded tensors onto.
-            **kwargs: Forwarded to ``__init__`` (``asr_normalize_type``, ``freeze_diar``, ...).
+            **kwargs: Forwarded to ``__init__`` (``asr_normalize_type``, ``freeze_diar``, ...), except
+                that ``asr_normalize_type='auto'`` is first resolved from the ASR checkpoint.
 
         Returns:
             A ``cls`` instance with both branches populated from their checkpoints.
@@ -775,6 +798,24 @@ class ParallelExpertEncoder(nn.Module):
 
         asr_cfg, asr_state = _resolve_branch_source(asr_model, ASRModel, map_location)
         diar_cfg, diar_state = _resolve_branch_source(diar_model, SortformerEncLabelModel, map_location)
+        kwargs = dict(kwargs)
+        if 'asr_normalize_type' not in kwargs:
+            logging.warning(
+                "ParallelExpertEncoder.from_checkpoints: asr_normalize_type is not set, so the ASR branch "
+                "re-normalizes its mels with 'per_feature' (the historical default). The ASR checkpoint %s "
+                "was trained with preprocessor.normalize=%r. Set asr_normalize_type explicitly, or to 'auto' "
+                "to follow the checkpoint.",
+                asr_model,
+                _checkpoint_normalize(asr_cfg, default='<not set>'),
+            )
+        elif isinstance(kwargs['asr_normalize_type'], str) and kwargs['asr_normalize_type'] == _NORMALIZE_AUTO:
+            kwargs['asr_normalize_type'] = _asr_normalize_type_from_checkpoint(asr_cfg, asr_model)
+            logging.info(
+                "ParallelExpertEncoder.from_checkpoints: asr_normalize_type='auto' resolved to %r from "
+                "the preprocessor.normalize of %s.",
+                kwargs['asr_normalize_type'],
+                asr_model,
+            )
         encoder = cls(
             asr_encoder_cfg=OmegaConf.create(asr_cfg['encoder']),
             diarization_model_cfg=OmegaConf.create(diar_cfg),
@@ -1726,6 +1767,38 @@ def _resolve_branch_source(path_or_name: str, model_cls, map_location):
     logging.info("Resolving PE branch %r via %s.from_pretrained", path_or_name, model_cls.__name__)
     model = model_cls.from_pretrained(model_name=path_or_name, map_location=map_location).eval()
     return OmegaConf.to_container(model.cfg, resolve=True), model.state_dict()
+
+
+def _checkpoint_normalize(asr_cfg, default=_NORMALIZE_UNSET):
+    """Return the ASR checkpoint config's ``preprocessor.normalize``, or ``default`` when it has none."""
+    preprocessor = asr_cfg.get('preprocessor', None) if isinstance(asr_cfg, Mapping) else None
+    if not isinstance(preprocessor, Mapping) or 'normalize' not in preprocessor:
+        return default
+    return preprocessor['normalize']
+
+
+def _asr_normalize_type_from_checkpoint(asr_cfg, source):
+    """Resolve ``asr_normalize_type='auto'``: the ASR branch replays its checkpoint's own normalization.
+
+    ``NA``, ``null`` or an empty value mean the checkpoint's preprocessor does not normalize, so the
+    branch must not either (``None``). ``per_feature`` and ``all_features`` are replayed as given.
+    Anything else, or a config without ``preprocessor.normalize``, raises: guessing would feed the
+    branch mels it was not trained on.
+    """
+    normalize = _checkpoint_normalize(asr_cfg)
+    if normalize is _NORMALIZE_UNSET:
+        raise ValueError(
+            f"asr_normalize_type='auto' cannot follow the ASR checkpoint {source!r}: its config has no "
+            "preprocessor.normalize. Set asr_normalize_type explicitly ('per_feature', 'all_features', or null/'NA')."
+        )
+    if not normalize or normalize == 'NA':
+        return None
+    if isinstance(normalize, str) and normalize in _NORMALIZE_AUTO_FOLLOWED:
+        return normalize
+    raise ValueError(
+        f"asr_normalize_type='auto' cannot follow the ASR checkpoint {source!r}: its preprocessor.normalize="
+        f"{normalize!r} is not one of {list(_NORMALIZE_AUTO_FOLLOWED)} or NA/null. Set asr_normalize_type explicitly."
+    )
 
 
 # Everything the PE reads off its ASR branch. Checked by name rather than with `isinstance` so any

@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
+from collections.abc import Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -590,6 +592,10 @@ def setup_parallel_expert_encoder_from_checkpoints(model: torch.nn.Module):
     Prefer a bundle for anything you intend to distribute or reproduce exactly -- assembling from
     checkpoints leaves the fusion LayerNorms (``asr_norm`` / ``diar_norm``) at init, since they
     exist in neither source.
+
+    ``asr_normalize_type: auto`` is resolved from the ASR checkpoint's preprocessor, and the resolved
+    value (``'NA'`` for no normalization) replaces ``auto`` in ``model.cfg`` and in the saved
+    hyperparameters, so a checkpoint or export reloads with the value it was trained with.
     """
     cfg = model.cfg.get("parallel_expert_encoder", None)
     if not cfg:
@@ -632,6 +638,8 @@ def setup_parallel_expert_encoder_from_checkpoints(model: torch.nn.Module):
     kwargs.setdefault("att_context_size", model.cfg.get("att_context_size", None))
     pe_encoder = encoder_cls.from_checkpoints(asr_model, diar_model, **kwargs)
     mount_parallel_expert_encoder(model, pe_encoder, source=f"{asr_model} + {diar_model}")
+    if _is_auto_normalize(kwargs.get("asr_normalize_type", None)):
+        _persist_resolved_asr_normalize_type(model, pe_encoder.asr_normalize_type)
 
 
 def mount_parallel_expert_encoder(model: torch.nn.Module, pe_encoder, source: str):
@@ -736,6 +744,47 @@ def _apply_perception_sync_flag(model: torch.nn.Module, pe_encoder) -> None:
         "model.perception.encoder.sync_max_audio_length.",
         bool(flag),
     )
+
+
+def _is_auto_normalize(value) -> bool:
+    return isinstance(value, str) and value == "auto"
+
+
+def _persist_resolved_asr_normalize_type(model: torch.nn.Module, resolved) -> None:
+    """Replace ``parallel_expert_encoder.asr_normalize_type: auto`` with the value it resolved to.
+
+    Written to ``model.cfg`` (what HF export saves) and to the Lightning hyperparameters (what a
+    ``.ckpt`` saves), so a reload does not re-derive it from a checkpoint that may have changed.
+    ``None`` is written as ``'NA'``: a serializer that drops null values would otherwise turn it into
+    an absent key, which means ``per_feature``. Lightning keeps the caller's ``cfg`` object as the
+    hyperparameter, so it is replaced by an updated copy rather than edited in place.
+    """
+    persisted = "NA" if resolved is None else resolved
+    _set_auto_normalize(model.cfg, persisted)
+    hparams = getattr(model, "hparams", None)
+    saved_cfg = hparams.get("cfg", None) if isinstance(hparams, Mapping) else None
+    if _pe_normalize_is_auto(saved_cfg):
+        saved_cfg = copy.deepcopy(saved_cfg)
+        _set_auto_normalize(saved_cfg, persisted)
+        hparams["cfg"] = saved_cfg
+    logging.info("Persisted parallel_expert_encoder.asr_normalize_type=%r (resolved from 'auto').", persisted)
+
+
+def _pe_normalize_is_auto(cfg) -> bool:
+    pe_cfg = cfg.get("parallel_expert_encoder", None) if isinstance(cfg, Mapping) else None
+    return isinstance(pe_cfg, Mapping) and _is_auto_normalize(pe_cfg.get("asr_normalize_type", None))
+
+
+def _set_auto_normalize(cfg, value) -> None:
+    """Set ``cfg.parallel_expert_encoder.asr_normalize_type`` to ``value`` if it is ``auto``."""
+    if not _pe_normalize_is_auto(cfg):
+        return
+    pe_cfg = cfg["parallel_expert_encoder"]
+    if isinstance(pe_cfg, DictConfig):
+        with open_dict(pe_cfg):
+            pe_cfg.asr_normalize_type = value
+    else:
+        pe_cfg["asr_normalize_type"] = value
 
 
 def _remap_asr_state_dict(asr_state: Dict[str, torch.Tensor], perception) -> Dict[str, torch.Tensor]:

@@ -483,6 +483,23 @@ both routes: a bundle always mounts as the streaming class, whatever ``target`` 
 the same for both classes; the streaming class only adds the cache-aware streaming interface.
 SALM's bundle mount is unchanged (a local ``.nemo`` mounts as the plain ``ParallelExpertEncoder``).
 
+The ASR branch receives un-normalized mels and replays ``asr_normalize_type`` itself. On the
+two-checkpoint route, ``model.parallel_expert_encoder.asr_normalize_type`` takes these values:
+
+- absent: ``per_feature``, as before, with a warning. This ignores the ASR checkpoint's own
+  ``preprocessor.normalize``, so an ASR model trained with ``normalize: NA`` is fed re-normalized
+  mels;
+- ``null`` or ``NA``: no normalization;
+- ``per_feature`` or ``all_features``: that normalization;
+- ``auto``: the ASR checkpoint's ``preprocessor.normalize`` (``NA`` or ``null`` gives no
+  normalization; ``per_feature`` and ``all_features`` are replayed as given). Any other checkpoint
+  value, or none, is an error. The resolved value (``NA`` for no normalization) replaces ``auto``
+  in the model config and in the saved hyperparameters, so a checkpoint or an export reloads with
+  the value it was trained with.
+
+``auto`` needs the ASR checkpoint's preprocessor config, so a bundle (``model.pe_encoder_overrides``)
+rejects it.
+
 The keys accepted in ``model.pe_encoder_overrides``:
 
 .. list-table::
@@ -494,7 +511,8 @@ The keys accepted in ``model.pe_encoder_overrides``:
    * - ``speaker_feature_config_version``, ``speaker_feature_mode``, ``speaker_activity_threshold``
      - The speaker-feature fusion contract (thresholded or continuous speaker activity).
    * - ``asr_normalize_type``, ``spk_kernel_scale``
-     - Normalization replayed on the ASR branch; scale of the speaker kernel.
+     - Normalization replayed on the ASR branch (``per_feature``, ``all_features``, or ``null``/``NA``
+       for none; ``auto`` is rejected); scale of the speaker kernel.
    * - ``missing_rttm_target``
      - Rows whose speaker targets are all at or below this value have no RTTM and are filled from
        the diarizer. Default ``-1.0``.

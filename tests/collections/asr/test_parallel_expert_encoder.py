@@ -784,6 +784,121 @@ def test_disabled_normalization_feeds_asr_branch_untouched(normalize_type, shoul
     assert torch.equal(fused, standalone) is should_match
 
 
+def write_toy_branch_checkpoints(tmp_path, asr_normalize=_UNSET_SENTINEL) -> tuple:
+    """Write a standalone ASR ``.nemo`` and a Sortformer ``.nemo`` for ``from_checkpoints``.
+
+    The ASR config carries ``preprocessor.normalize: asr_normalize`` (the key is left out for
+    ``_UNSET_SENTINEL``); the weights come from one toy PE, so both files load strictly.
+    """
+    source = build_toy_pe_encoder()
+    preprocessor = {
+        '_target_': 'nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor',
+        'features': _MEL_FEATURES,
+    }
+    if asr_normalize is not _UNSET_SENTINEL:
+        preprocessor['normalize'] = asr_normalize
+    asr_cfg = {'preprocessor': preprocessor, 'encoder': OmegaConf.to_container(toy_asr_encoder_cfg())}
+    asr_state = {f'encoder.{key}': value for key, value in source.asr_encoder.state_dict().items()}
+    diar_cfg = OmegaConf.to_container(toy_diarization_model_cfg())
+    return (
+        _write_nemo(tmp_path / 'asr.nemo', asr_cfg, asr_state),
+        _write_nemo(tmp_path / 'diar.nemo', diar_cfg, source.diarization_model.state_dict()),
+    )
+
+
+def _write_nemo(path, cfg: dict, state: dict) -> str:
+    weights = io.BytesIO()
+    torch.save(state, weights)
+    members = {
+        'model_config.yaml': OmegaConf.to_yaml(OmegaConf.create(cfg)).encode(),
+        'model_weights.ckpt': weights.getvalue(),
+    }
+    with tarfile.open(path, 'w') as archive:
+        for name, payload in members.items():
+            info = tarfile.TarInfo(name=name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+    return str(path)
+
+
+def _capture_pe_warnings(monkeypatch) -> list:
+    import nemo.collections.asr.modules.parallel_expert_encoder as pe_module
+
+    warnings = []
+    monkeypatch.setattr(pe_module.logging, 'warning', lambda msg, *args, **kwargs: warnings.append(msg % args))
+    return warnings
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "checkpoint_normalize, expected",
+    [('NA', None), (None, None), ('per_feature', 'per_feature'), ('all_features', 'all_features')],
+)
+def test_auto_normalization_follows_asr_checkpoint(tmp_path, monkeypatch, checkpoint_normalize, expected):
+    """PF-4: `asr_normalize_type: auto` replays the ASR checkpoint's own `preprocessor.normalize`. The
+    Nemotron streaming ASR checkpoint says `normalize: NA`, and re-normalizing its mels with the
+    `per_feature` default was a train/test mismatch."""
+    warnings = _capture_pe_warnings(monkeypatch)
+    asr, diar = write_toy_branch_checkpoints(tmp_path, asr_normalize=checkpoint_normalize)
+
+    enc = ParallelExpertEncoder.from_checkpoints(asr, diar, asr_normalize_type='auto')
+
+    assert enc.asr_normalize_type == expected
+    assert not [line for line in warnings if 'asr_normalize_type' in line]
+
+
+@pytest.mark.unit
+def test_absent_key_keeps_per_feature_and_warns(tmp_path, monkeypatch):
+    """Compatibility pin: an absent key keeps the historical `per_feature`, even when the checkpoint
+    says `NA`, so old configs and hparams build the encoder they were trained with; it now warns."""
+    warnings = _capture_pe_warnings(monkeypatch)
+    asr, diar = write_toy_branch_checkpoints(tmp_path, asr_normalize='NA')
+
+    enc = ParallelExpertEncoder.from_checkpoints(asr, diar)
+
+    assert enc.asr_normalize_type == 'per_feature'
+    [warning] = [line for line in warnings if 'asr_normalize_type is not set' in line]
+    assert "'per_feature'" in warning and "normalize='NA'" in warning and "'auto'" in warning
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("explicit, expected", [(None, None), ('NA', None), ('per_feature', 'per_feature')])
+def test_explicit_normalization_wins_over_the_checkpoint(tmp_path, monkeypatch, explicit, expected):
+    """An explicit value is used as given, whatever the checkpoint says, and does not warn."""
+    warnings = _capture_pe_warnings(monkeypatch)
+    asr, diar = write_toy_branch_checkpoints(tmp_path, asr_normalize='all_features')
+
+    enc = ParallelExpertEncoder.from_checkpoints(asr, diar, asr_normalize_type=explicit)
+
+    assert enc.asr_normalize_type == expected
+    assert not [line for line in warnings if 'asr_normalize_type' in line]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "checkpoint_normalize, error_match",
+    [(_UNSET_SENTINEL, "no preprocessor.normalize"), ('fancy', "normalize='fancy' is not one of")],
+    ids=["no_normalize_key", "unknown_value"],
+)
+def test_auto_normalization_fails_closed(tmp_path, checkpoint_normalize, error_match):
+    """`auto` refuses to guess when the checkpoint does not state a normalization it can replay."""
+    asr, diar = write_toy_branch_checkpoints(tmp_path, asr_normalize=checkpoint_normalize)
+
+    with pytest.raises(ValueError, match=error_match):
+        ParallelExpertEncoder.from_checkpoints(asr, diar, asr_normalize_type='auto')
+
+
+@pytest.mark.unit
+def test_auto_normalization_is_rejected_without_an_asr_checkpoint(tmp_path):
+    """The constructor and the bundle route have no ASR preprocessor config to follow, so `auto`
+    raises there instead of reaching `normalize_batch`, which would silently skip normalization."""
+    with pytest.raises(ValueError, match="only ParallelExpertEncoder.from_checkpoints"):
+        build_toy_pe_encoder(asr_normalize_type='auto')
+    bundle = write_toy_bundle(tmp_path / 'pe.nemo')
+    with pytest.raises(ValueError, match="only ParallelExpertEncoder.from_checkpoints"):
+        ParallelExpertEncoderPT.load_from_nemo(bundle, config_overrides={'asr_normalize_type': 'auto'})
+
+
 @pytest.mark.unit
 def test_apply_internal_freeze_reasserts_the_branch_split():
     """A blanket outer unfreeze must not put the frozen diarizer back in the optimizer.
