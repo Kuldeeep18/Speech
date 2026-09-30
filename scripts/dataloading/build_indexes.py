@@ -401,7 +401,7 @@ def discover(
 
 
 def _discover_shar(shar_path, jobs: list[IndexJob], indexes_root: Optional[str]) -> None:
-    """Index every uncompressed JSONL/tar shard inside one or more Shar dirs."""
+    """Index every JSONL/tar shard inside one or more Shar dirs."""
     if shar_path is None:
         return
     if isinstance(shar_path, (str, Path)):
@@ -418,7 +418,7 @@ def _discover_shar(shar_path, jobs: list[IndexJob], indexes_root: Optional[str])
         for v in shar_path.values():
             for raw in _flatten_path_spec(v):
                 for p in expand_sharded_filepaths(raw):
-                    if p.endswith(".jsonl"):
+                    if p.endswith((".jsonl", ".jsonl.gz")):
                         jobs.append(IndexJob(p, JSONL, indexes_root))
                     elif p.endswith(".tar"):
                         jobs.append(IndexJob(p, WDS_TAR, indexes_root))
@@ -431,7 +431,7 @@ def _discover_shar(shar_path, jobs: list[IndexJob], indexes_root: Optional[str])
         if not d.is_dir():
             continue
         for p in sorted(d.iterdir()):
-            if p.suffix == ".jsonl":
+            if p.name.endswith((".jsonl", ".jsonl.gz")):
                 jobs.append(IndexJob(str(p), JSONL, indexes_root))
             elif p.suffix == ".tar":
                 jobs.append(IndexJob(str(p), WDS_TAR, indexes_root))

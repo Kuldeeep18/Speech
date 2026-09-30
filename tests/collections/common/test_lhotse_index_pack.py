@@ -73,6 +73,8 @@ def test_gzip_jsonl_idxpack_build_and_validation(tmp_path):
     spec = IndexPackCollectionSpec(role="manifest", kind="jsonl", source_spec=str(path), paths=(str(path),))
     pack_path = tmp_path / "records.idxpack"
     write_index_pack(pack_path, [spec])
+    Path(job.idx_path()).unlink()
+    (tmp_path / "records.jsonl.gz.gzidx").unlink()
     with IndexPack(pack_path) as pack:
         assert pack.version == 4
         assert list(converter._iter_packed_manifest_shard_rows(pack.collection(spec.key), 0)) == records

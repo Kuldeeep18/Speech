@@ -766,7 +766,7 @@ def _compare_native_tar_route_signatures(
         zip(source_spec.manifest_paths, target_spec.manifest_paths, strict=True)
     ):
         gzip_info = _packed_gzip_index_info(source_manifest_collection.pack, source_manifest_path)
-        source_size = gzip_info[1] if gzip_info else source_manifest_collection.source_size_for_shard(shard_index)
+        source_size = gzip_info[0] if gzip_info else source_manifest_collection.source_size_for_shard(shard_index)
         current_source_size = int(_source_identity(source_manifest_path)["size_bytes"])
         if source_size != current_source_size:
             raise ValueError(

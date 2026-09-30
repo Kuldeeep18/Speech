@@ -1037,10 +1037,10 @@ read-only memory map and faults in offset pages on demand; it does not preload
 the offset payload into Python or NumPy memory.
 
 Gzip JSONL packs use format version 4. Their offsets refer to the
-uncompressed stream, and the pack records the companion ``.gzidx`` path and
-digest. Keep that seek index available with the local gzip source. Rebuild a
-gzip pack when moving its sources to different paths; catalog relocation does
-not rewrite gzip seek-index references.
+uncompressed stream, and the pack embeds the companion ``.gzidx`` contents.
+Loose ``.idx`` and ``.gzidx`` files are unnecessary after conversion. Rebuild
+a gzip pack when moving its sources to different paths; catalog relocation
+does not support gzip packs.
 
 Build loose sidecars first, then convert each independently configured dataset
 to its own pack. Most sidecars are copied directly. For paired native NeMo
