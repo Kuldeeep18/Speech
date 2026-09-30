@@ -51,6 +51,7 @@ import tempfile
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from itertools import zip_longest
 from multiprocessing import get_context
@@ -60,6 +61,7 @@ from typing import Optional
 import click
 from lhotse.index_pack import IndexPack, IndexPackArraySpec, IndexPackCollectionSpec, write_index_pack
 from lhotse.indexing import index_file_path
+from lhotse.packed_lazy import read_packed_range
 from lhotse.serialization import decode_json_line
 from omegaconf import DictConfig, ListConfig
 from scripts.dataloading._sharegpt_route_cli import ensure_sharegpt_route
@@ -693,11 +695,17 @@ def _native_tar_routing_signature(data: Mapping, *, path: str, row_index: int) -
     return "audio", nemo_tar_audio_member_name(audio_filepath)
 
 
+def _packed_gzip_index_info(pack: IndexPack, path: str):
+    lookup = getattr(pack, "gzip_index_info", None)
+    return lookup(path) if lookup is not None else None
+
+
 def _iter_packed_manifest_shard_rows(collection, shard_index: int):
     path = collection.path_for_shard(shard_index)
     row_count = collection.shard_length(shard_index)
     row_index = 0
-    with _open_data_path(path) as source:
+    gzip_info = _packed_gzip_index_info(collection.pack, path)
+    with _open_data_path(path) if gzip_info is None else nullcontext() as source:
         while row_index < row_count:
             first = collection.locate_in_shard(shard_index, row_index)
             batch_start = first.start
@@ -711,8 +719,11 @@ def _iter_packed_manifest_shard_rows(collection, shard_index: int):
                     break
                 batch_end_index += 1
                 batch_end = candidate.end
-            source.seek(batch_start)
-            raw = source.read(batch_end - batch_start)
+            if gzip_info is None:
+                source.seek(batch_start)
+                raw = source.read(batch_end - batch_start)
+            else:
+                raw = read_packed_range(collection.pack, path, batch_start, batch_end)
             if len(raw) != batch_end - batch_start:
                 raise EOFError(
                     f"Short packed manifest read from {path!r}: requested "
@@ -754,7 +765,8 @@ def _compare_native_tar_route_signatures(
     for shard_index, (source_manifest_path, target_manifest_path) in enumerate(
         zip(source_spec.manifest_paths, target_spec.manifest_paths, strict=True)
     ):
-        source_size = source_manifest_collection.source_size_for_shard(shard_index)
+        gzip_info = _packed_gzip_index_info(source_manifest_collection.pack, source_manifest_path)
+        source_size = gzip_info[1] if gzip_info else source_manifest_collection.source_size_for_shard(shard_index)
         current_source_size = int(_source_identity(source_manifest_path)["size_bytes"])
         if source_size != current_source_size:
             raise ValueError(

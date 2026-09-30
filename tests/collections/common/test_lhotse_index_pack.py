@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import gzip
 import io
 import json
 import struct
@@ -33,6 +34,7 @@ from lhotse.index_pack import (
 from lhotse.indexing import create_jsonl_index
 from lhotse.shar.lazy_pointer import decode_pointer, read_payload
 from omegaconf import OmegaConf
+from scripts.dataloading import build_indexes
 from scripts.dataloading import convert_indexes_to_idxpack as converter
 from scripts.dataloading import validate_idxpack_records as record_validator
 from scripts.dataloading.convert_indexes_to_idxpack import main
@@ -52,6 +54,31 @@ from nemo.collections.common.data.lhotse.nemo_tar_routing import (
     nemo_tar_ordinal_map_source_spec,
     nemo_tar_shard_map_collection_key,
 )
+
+
+def test_gzip_jsonl_idxpack_build_and_validation(tmp_path):
+    pytest.importorskip("indexed_gzip")
+    path = tmp_path / "records.jsonl.gz"
+    records = [{"id": str(i), "text": "hello" * 100} for i in range(4)]
+    with gzip.open(path, "wt") as source:
+        for record in records:
+            source.write(json.dumps(record) + "\n")
+
+    job = build_indexes.IndexJob(str(path), build_indexes.JSONL)
+    build_indexes._build_one(job)
+    build_indexes._validate_legacy_sidecar(job)
+    assert (tmp_path / "records.jsonl.gz.gzidx").is_file()
+    assert list(nemo_tar_routing._iter_indexed_manifest_rows(str(path), job.idx_path())) == records
+
+    spec = IndexPackCollectionSpec(role="manifest", kind="jsonl", source_spec=str(path), paths=(str(path),))
+    pack_path = tmp_path / "records.idxpack"
+    write_index_pack(pack_path, [spec])
+    with IndexPack(pack_path) as pack:
+        assert pack.version == 4
+        assert list(converter._iter_packed_manifest_shard_rows(pack.collection(spec.key), 0)) == records
+    result = CliRunner().invoke(validate_records_main, [str(pack_path)])
+    assert result.exit_code == 0, result.output
+    assert "records_checked=4" in result.output
 
 
 def _make_native_tar_dataset(tmp_path):

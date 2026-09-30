@@ -19,6 +19,7 @@ Walks a NeMo dataloading config (``input_cfg`` YAML, including nested ``group``
 entries and per-entry YAML references), discovers every JSONL/tar file an
 indexed dataloader will need, and creates the corresponding ``.idx`` sidecars
 next to each data file.
+Gzip JSONL also creates a ``.gzidx`` seek-index companion.
 
 Two tar layouts are dispatched correctly:
 
@@ -444,6 +445,10 @@ def _discover_shar(shar_path, jobs: list[IndexJob], indexes_root: Optional[str])
 def _remove_sidecars_for_rebuild(job: IndexJob) -> None:
     idx_path = Path(job.idx_path())
     idx_path.unlink(missing_ok=True)
+    if job.kind == JSONL and job.path.endswith((".jsonl.gz", ".json.gz")):
+        from lhotse.indexing import gzip_index_file_path
+
+        Path(gzip_index_file_path(job.path, index_path=idx_path)).unlink(missing_ok=True)
     if job.kind == WDS_TAR_V2:
         wds_v2_metadata_path(idx_path).unlink(missing_ok=True)
 
@@ -503,6 +508,7 @@ def _source_size(path: str) -> int:
 
 def _validate_legacy_sidecar(job: IndexJob) -> None:
     from lhotse.indexing import read_index
+    from lhotse.serialization import open_best
 
     idx_path = Path(job.idx_path())
     offsets = read_index(idx_path)
@@ -510,13 +516,27 @@ def _validate_legacy_sidecar(job: IndexJob) -> None:
         raise ValueError(f"Index contains no source-size sentinel: {idx_path}")
     if offsets.shape[0] > 1 and (offsets[1:] < offsets[:-1]).any():
         raise ValueError(f"Index offsets are not monotonic: {idx_path}")
-    source_size = _source_size(job.path)
+    gzip_jsonl = job.kind == JSONL and job.path.endswith((".jsonl.gz", ".json.gz"))
+    if gzip_jsonl:
+        from lhotse.indexing import _open_for_indexed_read, _require_indexed_gzip, gzip_index_file_path
+
+        seek_index_path = gzip_index_file_path(job.path, index_path=idx_path)
+        with _open_for_indexed_read(job.path) as source:
+            with _require_indexed_gzip().IndexedGzipFile(fileobj=source) as reader:
+                with open_best(seek_index_path, "rb") as seek_index:
+                    reader.import_index(fileobj=seek_index)
+                source_size = reader.seek(0, os.SEEK_END)
+    else:
+        source_size = _source_size(job.path)
     if int(offsets[-1]) != source_size:
         raise ValueError(f"Index sentinel mismatch for {job.path}: index={int(offsets[-1])}, source={source_size}")
 
     if not job.path.startswith(("ais://", "s3://")):
         source_stat = Path(job.path).stat()
-        if source_stat.st_mtime_ns > idx_path.stat().st_mtime_ns:
+        index_mtime = idx_path.stat().st_mtime_ns
+        if gzip_jsonl:
+            index_mtime = min(index_mtime, Path(seek_index_path).stat().st_mtime_ns)
+        if source_stat.st_mtime_ns > index_mtime:
             raise ValueError(f"Indexed source is newer than sidecar: {job.path}")
 
 

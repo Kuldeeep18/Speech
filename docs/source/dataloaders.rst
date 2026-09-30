@@ -1022,6 +1022,8 @@ Two equivalent ways:
    Pass ``--indexes-root /path/to/mirror`` to write the sidecars to a
    separate directory tree that mirrors the data files' layout instead of
    placing them next to the data — see :ref:`lhotse-indexes-root` below.
+   Gzip JSONL requires Lhotse's optional ``indexed_gzip`` dependency and
+   creates both ``<source>.idx`` and ``<source>.gzidx`` in that location.
 
 Packing sidecars into dataset-level ``.idxpack`` files
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -1033,6 +1035,12 @@ combines the existing sidecar payloads and ordered shard catalog for one
 dataset into one immutable file. Lhotse opens the pack through a single
 read-only memory map and faults in offset pages on demand; it does not preload
 the offset payload into Python or NumPy memory.
+
+Gzip JSONL packs use format version 4. Their offsets refer to the
+uncompressed stream, and the pack records the companion ``.gzidx`` path and
+digest. Keep that seek index available with the local gzip source. Rebuild a
+gzip pack when moving its sources to different paths; catalog relocation does
+not rewrite gzip seek-index references.
 
 Build loose sidecars first, then convert each independently configured dataset
 to its own pack. Most sidecars are copied directly. For paired native NeMo
