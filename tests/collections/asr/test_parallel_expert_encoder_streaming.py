@@ -406,3 +406,182 @@ class TestDiarizationGating:
         monkeypatch.setattr(dist, "is_initialized", lambda: True)
         monkeypatch.setattr(dist, "get_world_size", lambda: 1)
         assert self._encoder()._should_run_diarization(self._targets(n_missing=0)) is False
+
+
+# ==============================================================================================
+# Oracle targets with missing-RTTM sentinel rows (per-row diarizer fallback in the streaming step)
+# ==============================================================================================
+
+_SENTINEL = -1.0
+_N_CHUNKS = 3
+
+
+def _stream(enc, mel, targets=None, sentinel_rows=(), sentinel_chunks=range(_N_CHUNKS)):
+    """Step ``enc`` over the first ``_N_CHUNKS`` chunks of ``mel`` and return each chunk's output.
+
+    ``targets`` is a ``(B, T, n_spk)`` oracle tensor on the encoder-frame grid, sliced per chunk the
+    way StreamingSTT slices it. The last slice is a single frame, shorter than the chunk's output, as
+    at the end of a stream. ``sentinel_rows`` are overwritten with the missing-RTTM sentinel on ``sentinel_chunks``.
+    """
+    batch = mel.shape[0]
+    chunk_size = enc.streaming_cfg.chunk_size
+    chunk_size = chunk_size[1] if isinstance(chunk_size, (list, tuple)) else chunk_size
+    shift = enc.streaming_cfg.shift_size
+    shift = shift[1] if isinstance(shift, (list, tuple)) else shift
+    frames = chunk_size // _SUBSAMPLING_FACTOR
+    state = list(enc.get_initial_cache_state(batch_size=batch, dtype=mel.dtype, device=mel.device))
+    outputs = []
+    with torch.no_grad():
+        for step in range(_N_CHUNKS):
+            chunk = mel[:, :, step * shift : step * shift + chunk_size]
+            assert chunk.shape[-1] == chunk_size, "the toy mel is too short for _N_CHUNKS chunks"
+            kwargs = {}
+            if targets is not None:
+                width = 1 if step == _N_CHUNKS - 1 else frames
+                chunk_targets = targets[:, step * frames : step * frames + width].clone()
+                if step in sentinel_chunks:
+                    for row in sentinel_rows:
+                        chunk_targets[row] = _SENTINEL
+                kwargs["spk_targets"] = chunk_targets
+            out = enc.cache_aware_stream_step(
+                processed_signal=chunk,
+                processed_signal_length=torch.tensor([chunk_size] * batch),
+                cache_last_channel=state[0],
+                cache_last_time=state[1],
+                cache_last_channel_len=state[2],
+                keep_all_outputs=False,
+                drop_extra_pre_encoded=0 if step == 0 else enc.streaming_cfg.drop_extra_pre_encoded,
+                **kwargs,
+            )
+            outputs.append(out[0])
+            state = list(out[2:])
+    return outputs
+
+
+def _sentinel_fixture(batch=3):
+    """A seeded toy streaming encoder, mel batch and random oracle targets that differ across speakers.
+
+    Speaker-distinct values matter: ``diar_norm`` is a LayerNorm over the speakers, so a
+    speaker-constant row (all zeros, all ones, or the sentinel itself) maps to its bias, and a
+    comparison built on such rows would not tell diarizer predictions from silence. Seeded for the
+    same reason: some initialisations of the toy diarizer predict every speaker above the threshold.
+    """
+    torch.manual_seed(0)
+    enc = build_toy_streaming_pe_encoder().eval()
+    enc.setup_streaming_params()
+    generator = torch.Generator().manual_seed(0)
+    mel = torch.randn(batch, _MEL_FEATURES, 512, generator=generator)
+    targets = torch.rand(batch, 512 // _SUBSAMPLING_FACTOR, _N_SPK, generator=generator)
+    return enc, mel, targets
+
+
+@pytest.mark.unit
+def test_streaming_step_substitutes_sentinel_rows():
+    """A sentinel row must get the diarizer's predictions, and a real row keep its oracle targets.
+
+    The sentinel means "no RTTM for this row, use your own diarizer". The offline path honours it
+    per row; the streaming step used to fuse the sentinel itself, which ``diar_norm`` maps to the
+    same output as all-zero targets: the row was decoded as if nobody spoke.
+    """
+    enc, mel, targets = _sentinel_fixture()
+    diarizer = _stream(enc, mel)  # no targets: every row gets the diarizer's predictions
+    oracle = _stream(enc, mel, targets)
+    silence = _stream(enc, mel, torch.zeros_like(targets))
+    mixed = _stream(enc, mel, targets, sentinel_rows=(1,))
+
+    for step in range(_N_CHUNKS):
+        # The toy must be able to tell the two apart, or the assertions below prove nothing.
+        assert not torch.equal(diarizer[step][1], silence[step][1]), f"degenerate toy at chunk {step}"
+        assert not torch.equal(mixed[step][1], silence[step][1]), f"sentinel row fused as silence at chunk {step}"
+        assert torch.equal(mixed[step][1], diarizer[step][1]), f"sentinel row is not the diarizer's at chunk {step}"
+        for row in (0, 2):
+            assert torch.equal(mixed[step][row], oracle[step][row]), f"real row {row} changed at chunk {step}"
+
+
+@pytest.mark.unit
+def test_all_sentinel_stream_equals_no_targets():
+    """A batch without any RTTM decodes exactly as if no targets had been passed."""
+    enc, mel, targets = _sentinel_fixture()
+    diarizer = _stream(enc, mel)
+    all_sentinel = _stream(enc, mel, targets, sentinel_rows=(0, 1, 2))
+    for step in range(_N_CHUNKS):
+        assert torch.equal(all_sentinel[step], diarizer[step]), f"chunk {step} differs"
+
+
+@pytest.mark.unit
+def test_full_coverage_stream_is_unchanged_and_never_steps_the_diarizer():
+    """Pin: when every row has real targets, the step is the ASR branch's step plus the fusion of
+    those targets, bit for bit, and the diarizer is never stepped (no cost, no state, no RNG draw)."""
+    enc, mel, targets = _sentinel_fixture()
+    calls = []
+    original = enc.diarization_model.forward_streaming_step
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    enc.diarization_model.forward_streaming_step = spy
+    rng_before = torch.get_rng_state()
+    outputs = _stream(enc, mel, targets)
+    assert torch.equal(torch.get_rng_state(), rng_before)
+    assert calls == [], "the diarizer was stepped for a batch whose rows all have real targets"
+    assert enc._diar_total_preds.shape[1] == 0
+
+    # The same stream through the bare ASR branch, fused with the same slices.
+    bare = enc.asr_encoder
+    chunk_size = enc.streaming_cfg.chunk_size
+    chunk_size = chunk_size[1] if isinstance(chunk_size, (list, tuple)) else chunk_size
+    shift = enc.streaming_cfg.shift_size
+    shift = shift[1] if isinstance(shift, (list, tuple)) else shift
+    frames = chunk_size // _SUBSAMPLING_FACTOR
+    batch = mel.shape[0]
+    state = list(bare.get_initial_cache_state(batch_size=batch, dtype=mel.dtype, device=mel.device))
+    with torch.no_grad():
+        for step in range(_N_CHUNKS):
+            out = bare.cache_aware_stream_step(
+                processed_signal=mel[:, :, step * shift : step * shift + chunk_size],
+                processed_signal_length=torch.tensor([chunk_size] * batch),
+                cache_last_channel=state[0],
+                cache_last_time=state[1],
+                cache_last_channel_len=state[2],
+                keep_all_outputs=False,
+                drop_extra_pre_encoded=0 if step == 0 else enc.streaming_cfg.drop_extra_pre_encoded,
+            )
+            width = 1 if step == _N_CHUNKS - 1 else frames
+            expected = enc._fuse_diar_and_asr(out[0], targets[:, step * frames : step * frames + width])
+            assert torch.equal(outputs[step], expected), f"chunk {step} differs"
+            state = list(out[2:])
+
+
+@pytest.mark.unit
+def test_a_stream_that_steps_the_diarizer_keeps_stepping_it():
+    """The diarizer's state is batched and follows the audio, so once a stream has stepped it, it is
+    stepped on every later chunk, also on chunks whose rows all have real targets."""
+    enc, mel, targets = _sentinel_fixture()
+    calls = []
+    original = enc.diarization_model.forward_streaming_step
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    oracle = _stream(enc, mel, targets)
+    enc.diarization_model.forward_streaming_step = spy
+    # The sentinel on chunk 0 only: not what the dataset produces, but the state must still follow.
+    stepped = _stream(enc, mel, targets, sentinel_rows=(1,), sentinel_chunks={0})
+    assert len(calls) == _N_CHUNKS, f"the diarizer was stepped on {len(calls)} of {_N_CHUNKS} chunks"
+    for step in range(1, _N_CHUNKS):
+        assert torch.equal(stepped[step], oracle[step]), f"chunk {step} has no sentinel row but changed"
+
+
+@pytest.mark.unit
+def test_a_sentinel_row_after_skipped_chunks_fails_closed():
+    """A diarizer that skipped the start of a stream has no state for it; fusing its predictions
+    would be silently wrong, so the step raises. A new stream starts clean."""
+    enc, mel, targets = _sentinel_fixture()
+    with pytest.raises(RuntimeError, match="has not seen the start"):
+        _stream(enc, mel, targets, sentinel_rows=(1,), sentinel_chunks=range(1, _N_CHUNKS))
+    # `get_initial_cache_state` resets the decision: a stream with sentinel rows from chunk 0 works.
+    diarizer = _stream(enc, mel)
+    mixed = _stream(enc, mel, targets, sentinel_rows=(1,))
+    assert all(torch.equal(m[1], d[1]) for m, d in zip(mixed, diarizer))

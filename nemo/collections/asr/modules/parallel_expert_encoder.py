@@ -121,6 +121,10 @@ _DIAR_UNSET = object()
 # which `_align_diar_frames` would otherwise truncate or stretch without a word.
 _MAX_DIAR_ASR_FRAME_MISMATCH = 2
 
+# Whether a stream of `StreamingParallelExpertEncoder.cache_aware_stream_step` steps its diarizer.
+_DIAR_STREAM_STEPPED = "stepped"
+_DIAR_STREAM_SKIPPED = "skipped"
+
 
 # --- Speaker-feature fusion contract -------------------------------------------------------
 # Ported from the SALM-side encoder so a bundle states, rather than implies, how its speaker
@@ -1458,6 +1462,8 @@ class StreamingParallelExpertEncoder(ParallelExpertEncoder, StreamingEncoder):
     _diar_streaming_state = None
     _diar_total_preds = None
     _diar_stream_dtype = None
+    # Whether the current stream steps the diarizer; ``None`` until its first chunk.
+    _diar_stream_source = None
 
     @property
     def streaming_cfg(self):
@@ -1490,6 +1496,7 @@ class StreamingParallelExpertEncoder(ParallelExpertEncoder, StreamingEncoder):
         self._diar_total_preds = torch.zeros(
             (batch_size, 0, sm.n_spk), device=diar_device, dtype=self._diar_stream_dtype
         )
+        self._diar_stream_source = None
         return self.asr_encoder.get_initial_cache_state(
             batch_size=batch_size, dtype=dtype, device=device, max_dim=max_dim
         )
@@ -1511,6 +1518,15 @@ class StreamingParallelExpertEncoder(ParallelExpertEncoder, StreamingEncoder):
         omitted the embedded Sortformer is stepped on the same mel chunk and its newly emitted
         frames are used. Both branches see the identical chunk and ``drop_extra_pre_encoded``, which
         is what keeps the fusion frame-aligned (the same rule ``SpeakerTaggedASR`` follows).
+
+        Rows of ``spk_targets`` that carry the missing-RTTM sentinel get the diarizer's predictions
+        instead, as on the offline path: the Sortformer is stepped on the full batch and only those
+        rows are replaced. A stream whose rows all have real targets never steps it.
+
+        The diarizer keeps one batched streaming state, so within a stream it is stepped on every
+        chunk or on none. The first chunk after :meth:`get_initial_cache_state` decides. Once
+        stepped, it keeps being stepped, also on chunks without sentinel rows. A chunk that needs it
+        after chunks that skipped it raises, because its state has not seen the start of the audio.
         """
         if self.asr_normalize_type:
             asr_signal, _, _ = normalize_batch(
@@ -1535,7 +1551,13 @@ class StreamingParallelExpertEncoder(ParallelExpertEncoder, StreamingEncoder):
         asr_encoded, asr_encoded_len = asr_out[0], asr_out[1]
         rest = tuple(asr_out[2:])
 
-        if spk_targets is None:
+        sentinel_rows = None
+        if spk_targets is not None:
+            sentinel_rows = self.missing_rttm_rows(spk_targets)
+            if spk_targets.shape[1] == 0:
+                # A zero-width slice has no frames to be sentinel; `.all()` over it is vacuously True.
+                sentinel_rows = torch.zeros_like(sentinel_rows)
+        if self._should_step_stream_diarizer(spk_targets is None or bool(sentinel_rows.any())):
             # The ASR branch drops `drop_extra_pre_encoded` frames of pre-encode cache from its
             # output; the diarizer must drop the same, or it emits N+2 frames per N ASR frames and
             # the fusion consumes STALE predictions -- the speaker signal ends up one chunk behind
@@ -1544,12 +1566,48 @@ class StreamingParallelExpertEncoder(ParallelExpertEncoder, StreamingEncoder):
             diar_drop = drop_extra_pre_encoded
             if diar_drop is None:
                 diar_drop = getattr(self.asr_encoder.streaming_cfg, 'drop_extra_pre_encoded', None)
-            spk_targets = self._stream_diarizer(
+            diar_preds = self._stream_diarizer(
                 processed_signal, processed_signal_length, asr_encoded.shape[-1], diar_drop
             )
+            if spk_targets is None:
+                spk_targets = diar_preds
+            elif bool(sentinel_rows.any()):
+                # `diar_preds` is already on the ASR chunk's frame grid. The oracle slice can be
+                # shorter (the last chunk of a stream), so align it the way the fusion would: the
+                # real rows then fuse exactly as they do without the splice.
+                spk_targets = self._align_diar_frames(spk_targets, asr_encoded.shape[-1])
+                diar_preds = diar_preds.to(device=spk_targets.device, dtype=spk_targets.dtype)
+                spk_targets = torch.where(sentinel_rows.view(-1, 1, 1), diar_preds, spk_targets)
         if spk_targets is not None:
             asr_encoded = self._fuse_diar_and_asr(asr_encoded, spk_targets)
         return (asr_encoded, asr_encoded_len) + rest
+
+    def _should_step_stream_diarizer(self, needed: bool) -> bool:
+        """Whether to step the diarizer on this chunk, so that its state follows the whole stream.
+
+        Args:
+            needed (bool): this chunk needs diarizer predictions (no ``spk_targets``, or a sentinel row).
+
+        Returns:
+            bool: ``True`` if the stream already steps the diarizer, or if ``needed`` and no earlier
+            chunk skipped it; ``False`` otherwise.
+
+        Raises:
+            RuntimeError: if ``needed`` after chunks of the same stream that did not step the diarizer.
+        """
+        if self._diar_stream_source == _DIAR_STREAM_STEPPED:
+            return True
+        if needed and self._diar_stream_source == _DIAR_STREAM_SKIPPED:
+            raise RuntimeError(
+                "This chunk needs the embedded diarizer (it has no `spk_targets`, or a row carries the "
+                "missing-RTTM sentinel), but earlier chunks of this stream had real targets in every row. "
+                "The diarizer was not stepped on them, so its streaming state has not seen the start of "
+                "the audio. Mark a row without an RTTM as sentinel on every chunk of the stream (the "
+                "dataset fills such a row across its whole length), or call get_initial_cache_state() to "
+                "start a new stream."
+            )
+        self._diar_stream_source = _DIAR_STREAM_STEPPED if needed else _DIAR_STREAM_SKIPPED
+        return needed
 
     def _stream_diarizer(self, processed_signal, processed_signal_length, align_target, drop_extra_pre_encoded):
         """Advance the Sortformer by one chunk and return its NEW frames, ASR-aligned."""
@@ -1562,8 +1620,8 @@ class StreamingParallelExpertEncoder(ParallelExpertEncoder, StreamingEncoder):
                 f"has batch {processed_signal.shape[0]}. The embedded Sortformer keeps ONE batched "
                 "state on the module, so it cannot follow a caller that steps a subset of streams "
                 "(as `_generate_dynamic_streaming` does when streams desynchronise).\n"
-                "Workarounds: pass `spk_targets` explicitly so the diarizer is not stepped, or use "
-                "the chunked streaming path, which always steps the full batch."
+                "Workarounds: pass `spk_targets` with real targets in every row so the diarizer is not "
+                "stepped, or use the chunked streaming path, which always steps the full batch."
             )
         if self._diar_streaming_state is None:
             raise RuntimeError(

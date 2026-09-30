@@ -249,6 +249,27 @@ corpus of such rows can exceed 100%, and a literal ``0.0`` joins the macro. Coun
 All counters are printed even at zero: a counter that appears only when non-zero cannot be told
 apart from one that was never computed.
 
+Oracle speaker targets
+----------------------
+
+A model with a Parallel Expert Encoder can decode with oracle (RTTM-derived) speaker activity in
+place of its embedded diarizer's predictions: pass ``spk_targets`` to ``generate`` with a streaming
+decoder. ``streaming_stt_generate.py``'s ``oracle_spk_targets`` needs a dataloader that emits them,
+and refuses to run without them.
+
+A cut without an RTTM carries the missing-RTTM sentinel (``missing_rttm_target``) across its whole
+row. In streaming decoding, as in training, such rows are filled from the embedded diarizer, row by
+row, and the other rows keep their oracle targets. The diarizer then runs on the full batch for
+every chunk of the stream. A batch in which every row has an RTTM never runs it, and decodes as it
+did before. A sentinel row that first appears after the stream's first chunk raises, because the
+diarizer's streaming state would not have seen the start of the audio.
+
+.. note::
+
+   Before this fill existed in the streaming step, streaming decoding fused a sentinel row as if
+   nobody was speaking. Oracle streaming results on data that mixes cuts with and without an RTTM
+   are affected on the rows without one; rerun them to compare.
+
 Long-form audio
 ---------------
 

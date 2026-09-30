@@ -138,6 +138,10 @@ def _tiny_llm(monkeypatch):
 @pytest.fixture
 def model_with_diarizer(monkeypatch):
     """A StreamingSTTModel whose perception encoder is a real StreamingParallelExpertEncoder."""
+    return _build_model_with_diarizer(monkeypatch)
+
+
+def _build_model_with_diarizer(monkeypatch):
     from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel
     from nemo.collections.speechlm2.parts.pretrained import mount_parallel_expert_encoder
 
@@ -582,3 +586,63 @@ def test_oracle_targets_reach_the_encoder_on_the_right_frame_window(model_with_d
     assert starts, "spk_targets never reached the encoder"
     expected = [k * CHUNK_SIZE for k in range(len(starts))]
     assert starts == expected, f"target windows were {starts}, expected {expected}"
+
+
+def _capture_embeddings(model, audios, lengths, state_machine, spk_targets):
+    """Every row's perception output, per perception call, for one decode."""
+    captured = []
+    original = type(model.perception).forward
+
+    def spy(self, *args, **kwargs):
+        out = original(self, *args, **kwargs)
+        captured.append(out[0].detach().clone())
+        return out
+
+    type(model.perception).forward = spy
+    try:
+        with torch.no_grad():
+            model.generate(
+                audios=audios,
+                audio_lens=torch.tensor(lengths),
+                system_prompt="Transcribe the audio into text.",
+                max_new_tokens=4,
+                use_state_machine_inference=state_machine,
+                chunk_size_override=CHUNK_SIZE,
+                **({"spk_targets": spk_targets} if spk_targets is not None else {}),
+            )
+    finally:
+        type(model.perception).forward = original
+    return captured
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("state_machine", [False, True], ids=["chunked", "state_machine"])
+def test_sentinel_rows_use_the_diarizer_on_both_decoders(monkeypatch, state_machine):
+    """A row whose oracle targets are the missing-RTTM sentinel (a cut without an RTTM) must be
+    encoded with the embedded diarizer's predictions, not fused as silence, while the other rows
+    keep their oracle targets. Checked on the embeddings, which the LLM's output does not feed back.
+
+    Seeded: the toy fuses thresholded activity, and some initialisations put every prediction above
+    the threshold. Such a speaker-constant row maps to ``diar_norm``'s bias, as silence does.
+    """
+    torch.manual_seed(0)
+    model_with_diarizer = _build_model_with_diarizer(monkeypatch)
+    audios, lengths = _unequal_length_audio()
+    frames = math.ceil(max(lengths) / int(model_with_diarizer._samples_per_encoder_frame()))
+    n_spk = model_with_diarizer.perception.encoder.diarization_model.sortformer_modules.n_spk
+    generator = torch.Generator().manual_seed(0)
+    oracle = torch.rand(len(lengths), frames, n_spk, generator=generator)
+    mixed = oracle.clone()
+    mixed[1] = model_with_diarizer.perception.encoder.missing_rttm_target
+    silence = oracle.clone()
+    silence[1] = 0.0
+
+    def capture(targets):
+        return _capture_embeddings(model_with_diarizer, audios, lengths, state_machine, targets)
+
+    diarizer, with_oracle, with_mixed, with_silence = capture(None), capture(oracle), capture(mixed), capture(silence)
+    assert len(diarizer) == len(with_oracle) == len(with_mixed) == len(with_silence) > 0
+    assert any(not torch.equal(d[1], s[1]) for d, s in zip(diarizer, with_silence)), "degenerate toy"
+    for call, (d, o, m) in enumerate(zip(diarizer, with_oracle, with_mixed)):
+        assert torch.equal(m[1], d[1]), f"the sentinel row is not the diarizer's at perception call {call}"
+        assert torch.equal(m[0], o[0]) and torch.equal(m[2], o[2]), f"a real row changed at call {call}"
