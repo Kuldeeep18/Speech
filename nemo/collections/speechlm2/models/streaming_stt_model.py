@@ -49,6 +49,7 @@ from nemo.collections.speechlm2.modules.perception import AudioPerceptionModule
 from nemo.collections.speechlm2.parts.alignments import ForcedAligner
 from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
+from nemo.collections.speechlm2.parts.multispeaker import MultiSpeakerConfig
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
 from nemo.collections.speechlm2.parts.pretrained import (
     load_pretrained_hf,
@@ -546,6 +547,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     unfreeze_module(lm_head)
 
         self._assert_context_flags_match_data(data_cfg)
+        self._assert_speaker_config_matches_data(data_cfg, val_data_cfg)
         self._setup_forced_aligner(forced_aligner, data_cfg, val_data_cfg, dataset_cls)
 
         logging.info("\n" + str(ModelSummary(self, max_depth=2)))
@@ -1745,6 +1747,61 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     f"model.flush_token={model_tok!r} but data.dataset.flush_token={data_tok!r}. "
                     f"These must match: the dataset supervises the position after the flush marker "
                     f"and inference feeds it, so differing strings feed an unsupervised token."
+                )
+
+    def _assert_speaker_config_matches_data(self, data_cfg, val_data_cfg=None) -> None:
+        """Fail at construction when the model, the dataset and a mounted PE disagree about speakers.
+
+        Checked only for a dataset config whose ``multispeaker_cfg`` is enabled:
+
+        - ``model.speaker_tokens.max_speakers`` (the registered ``<spk:N>`` tags) must not exceed
+          ``multispeaker_cfg.num_speakers`` (the width of ``spk_targets``). Fewer tags than columns
+          is valid: the reference recipe fuses 8 diarizer columns and emits 4 tags.
+        - A mounted ParallelExpertEncoder must fuse exactly ``num_speakers`` columns
+          (``n_spk``). Otherwise the first forward with speaker targets fails with an opaque shape
+          error (in the fusion LayerNorm, ``Given normalized_shape=[n_spk]``, or in the
+          missing-RTTM splice).
+        - Its ``missing_rttm_target`` must equal the dataset's. Otherwise rows without an RTTM
+          are fused as real speaker activity instead of being filled from the diarizer.
+
+        Without a dataset config (inference, HF reload) there is nothing to compare, so nothing
+        is checked. Safe to call before the perception module exists: the encoder checks are
+        then skipped.
+        """
+        encoder = getattr(getattr(self, "perception", None), "encoder", None)
+        spk_cfg = self.core_cfg.speaker_tokens or {}
+        for name, cfg in (("data.dataset", data_cfg), ("the validation dataset config", val_data_cfg)):
+            if cfg is None:
+                continue
+            raw = cfg.get("multispeaker_cfg", None) if hasattr(cfg, "get") else getattr(cfg, "multispeaker_cfg", None)
+            ms = MultiSpeakerConfig.from_dict(raw)
+            if ms is None or not ms.enable:
+                continue
+            if spk_cfg and spk_cfg.get("enable", True):
+                max_speakers = int(spk_cfg.get("max_speakers", 4))
+                if max_speakers > ms.num_speakers:
+                    raise ValueError(
+                        f"model.speaker_tokens.max_speakers={max_speakers} exceeds "
+                        f"{name}.multispeaker_cfg.num_speakers={ms.num_speakers}: tags <spk:{ms.num_speakers}> "
+                        "and above would have no speaker-target column. Set max_speakers <= num_speakers "
+                        "(fewer tags than columns is valid)."
+                    )
+            n_spk = getattr(encoder, "n_spk", None)
+            if n_spk is not None and int(n_spk) != ms.num_speakers:
+                raise ValueError(
+                    f"The mounted {type(encoder).__name__} fuses n_spk={int(n_spk)} speaker columns but "
+                    f"{name}.multispeaker_cfg.num_speakers={ms.num_speakers}, so the speaker targets would not "
+                    "fit it and the first forward would fail with a shape error. Set num_speakers to the "
+                    "diarizer's speaker count."
+                )
+            sentinel = getattr(encoder, "missing_rttm_target", None)
+            if sentinel is not None and float(sentinel) != ms.missing_rttm_target:
+                raise ValueError(
+                    f"The mounted {type(encoder).__name__} treats rows at or below "
+                    f"missing_rttm_target={float(sentinel)} as having no RTTM, but "
+                    f"{name}.multispeaker_cfg.missing_rttm_target={ms.missing_rttm_target}. Rows without an "
+                    "RTTM would be fused as real speaker activity instead of being filled from the diarizer. "
+                    "Set both to the same value."
                 )
 
     def _set_encoder_att_context(self, chunk_size: Optional[int], recompute_streaming: bool = False) -> None:

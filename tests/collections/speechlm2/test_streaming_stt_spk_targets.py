@@ -92,6 +92,15 @@ class TestSpkTargetsConfig:
         with pytest.raises(ValueError, match="single special token"):
             StreamingSTTDataset(cfg=_cfg(), tokenizer=bare)
 
+    @pytest.mark.unit
+    @pytest.mark.parametrize("num_speakers,expected", [(8, 4), (4, 4), (2, 2)])
+    def test_probe_counts_registered_tags_not_columns(self, tokenizer, num_speakers, expected):
+        # The model registers `speaker_tokens.max_speakers` tags (4 here), which may be fewer than
+        # the target columns: the reference fuses 8 columns and emits 4 tags. `<spk:4>` is six
+        # tokens, so probing every column index would reject that configuration.
+        ds = StreamingSTTDataset(cfg=_cfg(multispeaker_cfg={"num_speakers": num_speakers}), tokenizer=tokenizer)
+        assert ds._num_speaker_tags == expected
+
 
 class TestMultiSpeakerConfigDataclass:
     @pytest.mark.unit

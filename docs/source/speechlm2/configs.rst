@@ -528,6 +528,34 @@ The keys accepted in ``model.pe_encoder_overrides``:
      - Rejected with an error naming the key, because nothing in this encoder reads them. Use
        ``model.encoder_chunk_size_seconds`` to chunk long audio.
 
+Speaker Counts (StreamingSTT)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Three settings describe speakers in a multi-speaker StreamingSTT recipe:
+
+- ``model.speaker_tokens.max_speakers``: the number of ``<spk:N>`` tags registered as single
+  tokens;
+- ``data.dataset.multispeaker_cfg.num_speakers``: the number of speaker-target columns the dataset
+  builds from the RTTMs;
+- the speaker count of a mounted ``ParallelExpertEncoder`` (its diarizer's ``num_spks``), which is
+  the number of columns it fuses.
+
+When the model is built with a dataset config whose ``multispeaker_cfg`` is enabled (as
+``streaming_stt_train.py`` does), construction checks that:
+
+- ``max_speakers`` is at most ``num_speakers``. Fewer tags than columns is valid: for example an
+  8-speaker Sortformer with ``num_speakers: 8`` and ``max_speakers: 4``;
+- ``num_speakers`` equals the encoder's speaker count. Otherwise the first forward with speaker
+  targets fails with a shape error;
+- ``multispeaker_cfg.missing_rttm_target`` equals the encoder's ``missing_rttm_target``. Otherwise
+  rows without an RTTM are fused as real speaker activity instead of being filled from the
+  diarizer.
+
+The validation dataset config is checked the same way. ``StreamingSTTModelAutomodel`` runs the
+encoder checks in ``configure_model()``, after it mounts the encoder. Without a dataset config
+(inference, or a reload from a checkpoint or HF export) nothing is compared. The dataset requires
+``<spk:0>`` to be a single token and logs how many consecutive tags are registered.
+
 Data Parameters
 ^^^^^^^^^^^^^^^
 

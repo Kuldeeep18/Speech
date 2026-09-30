@@ -152,6 +152,10 @@ class StreamingSTTModelAutomodel(StreamingSTTModel):
 
         self._register_special_tokens()
         self._validate_lora_cfg()
+        # The speaker-count checks that need no encoder run now; the PE checks run in
+        # configure_model(), after the mount, against the same dataset configs.
+        self._speaker_guard_data_cfgs = (data_cfg, val_data_cfg)
+        self._assert_speaker_config_matches_data(data_cfg, val_data_cfg)
         self._setup_forced_aligner(forced_aligner, data_cfg, val_data_cfg, dataset_cls)
 
         if self.cfg.get("init_configure_model", False):
@@ -524,6 +528,7 @@ class StreamingSTTModelAutomodel(StreamingSTTModel):
             setup_parallel_expert_encoder(self, streaming=True)
         elif self.core_cfg.parallel_expert_encoder:
             setup_parallel_expert_encoder_from_checkpoints(self)
+        self._assert_speaker_config_matches_data(*getattr(self, "_speaker_guard_data_cfgs", (None, None)))
 
         # --- Aux chunk-boundary classifier (only built when enabled) ---
         if self.core_cfg.use_chunk_classifier:

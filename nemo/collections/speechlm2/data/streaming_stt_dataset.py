@@ -1368,11 +1368,16 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
                     "special token -- the model must add the <spk:N> tokens to the tokenizer before "
                     "constructing the dataset."
                 )
+            # The model registers `speaker_tokens.max_speakers` tags, which may be fewer than the
+            # `num_speakers` target columns (the reference fuses 8 columns and emits 4 tags), so
+            # count the consecutive single-token tags instead of requiring one per column.
+            self._num_speaker_tags = self._count_speaker_tags()
             logging.info(
-                "multispeaker SOT enabled: template=%s (id=%d), num_speakers=%d, "
+                "multispeaker SOT enabled: template=%s (id=%d), registered tags=%d, num_speakers=%d, "
                 "max_alignment_permutations=%s -> max_permutable=%s",
                 probe,
                 ids[0],
+                self._num_speaker_tags,
                 self._ms.num_speakers,
                 self._ms.max_alignment_permutations,
                 self._ms.max_permutable,
@@ -1420,6 +1425,20 @@ class StreamingSTTDataset(torch.utils.data.Dataset):
         if tracks:  # MixedCut: a mixture's labels live on its constituent tracks
             return any(StreamingSTTDataset._has_rttm_filepath(track.cut) for track in tracks)
         return False
+
+    def _count_speaker_tags(self) -> int:
+        """Number of consecutive single-token tags ``template.format(i=k)``, ``k < num_speakers``.
+
+        This is the number of tags the model registered (``speaker_tokens.max_speakers``), capped
+        at the number of speaker-target columns.
+        """
+        count = 0
+        while count < self._ms.num_speakers:
+            tag = self._speaker_token_template.format(i=count)
+            if len(self.tokenizer.tokenizer.encode(tag, add_special_tokens=False)) != 1:
+                break
+            count += 1
+        return count
 
     def _missing_rttm_activity(self, cut) -> "torch.Tensor":
         """Full-length ``missing_rttm_target`` activity for one cut.

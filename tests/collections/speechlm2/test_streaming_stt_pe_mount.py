@@ -206,3 +206,164 @@ def test_bundle_mounts_the_streaming_encoder_and_chunked_generate_runs(tmp_path,
         torch.set_default_device(previous)
     assert len(result.texts) == len(lengths)
     assert all(isinstance(text, str) for text in result.texts)
+
+
+# ----------------------------------------------------------------------------- #
+# Speaker-count guards at construction (model <-> dataset <-> mounted PE)
+# ----------------------------------------------------------------------------- #
+def _write_toy_bundle_with_speakers(path, n_spk: int, **cfg_overrides) -> str:
+    """A toy PE bundle whose diarizer fuses ``n_spk`` speaker columns."""
+    from tests.collections.asr.test_parallel_expert_encoder import (
+        build_toy_pe_encoder,
+        toy_diarization_model_cfg,
+        write_toy_bundle,
+    )
+
+    diar_cfg = toy_diarization_model_cfg()
+    diar_cfg.sortformer_modules.num_spks = n_spk
+    diar_cfg.max_num_of_spks = n_spk
+    encoder = build_toy_pe_encoder(diarization_model_cfg=diar_cfg)
+    return write_toy_bundle(path, encoder=encoder, diarization_model_cfg=diar_cfg, **cfg_overrides)
+
+
+def _speaker_data_cfg(num_speakers: int, **multispeaker_overrides):
+    from omegaconf import OmegaConf
+
+    multispeaker_cfg = {"enable": True, "num_speakers": num_speakers, **multispeaker_overrides}
+    return OmegaConf.create({"words_per_group": 1, "multispeaker_cfg": multispeaker_cfg})
+
+
+def _build_speaker_model(monkeypatch, bundle, max_speakers, data_cfg=None, val_data_cfg=None):
+    import torch
+
+    from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel
+    from tests.collections.speechlm2.test_streaming_stt_dynamic_diarizer import _tiny_llm, make_pe_cfg
+
+    previous = torch.get_default_device()
+    torch.set_default_device("cpu")
+    _tiny_llm(monkeypatch)
+    try:
+        cfg = make_pe_cfg(
+            pe_encoder_path=bundle,
+            speaker_tokens={"enable": True, "template": "<spk:{i}>", "max_speakers": max_speakers},
+        )
+        return StreamingSTTModel(cfg, data_cfg=data_cfg, val_data_cfg=val_data_cfg)
+    finally:
+        torch.set_default_device(previous)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "pe_spk,data_spk,in_val_only",
+    [(4, 8, False), (8, 4, False), (4, 8, True)],
+    ids=["8_columns_into_a_4_speaker_pe", "4_columns_into_an_8_speaker_pe", "validation_config_only"],
+)
+def test_streaming_stt_rejects_fusion_width_mismatch(tmp_path, monkeypatch, pe_spk, data_spk, in_val_only):
+    """PF-5: `multispeaker_cfg.num_speakers` must equal the mounted PE's `n_spk`. Before the guard
+    the model constructed and the first forward with speaker targets failed with an opaque shape
+    `RuntimeError` (`Given normalized_shape=[n_spk]` in the fusion LayerNorm, or a size mismatch in
+    the missing-RTTM splice)."""
+    bundle = _write_toy_bundle_with_speakers(tmp_path / "pe.nemo", n_spk=pe_spk)
+    data_cfg = _speaker_data_cfg(pe_spk if in_val_only else data_spk)
+    val_data_cfg = _speaker_data_cfg(data_spk) if in_val_only else None
+    with pytest.raises(ValueError, match=rf"n_spk={pe_spk} .*num_speakers={data_spk}"):
+        _build_speaker_model(monkeypatch, bundle, max_speakers=4, data_cfg=data_cfg, val_data_cfg=val_data_cfg)
+
+
+@pytest.mark.unit
+def test_eight_columns_four_tags_constructs(tmp_path, monkeypatch):
+    """Compatibility pin: the reference configuration fuses 8 diarizer columns (an 8-speaker
+    Sortformer, `num_speakers: 8`) and registers 4 tags (`max_speakers: 4`). It must construct, its
+    dataset must build against the model's tokenizer, and 8-column targets must fuse."""
+    import torch
+
+    from nemo.collections.speechlm2.data.streaming_stt_dataset import StreamingSTTDataset
+
+    data_cfg = _speaker_data_cfg(8)
+    model = _build_speaker_model(
+        monkeypatch, _write_toy_bundle_with_speakers(tmp_path / "pe.nemo", n_spk=8), 4, data_cfg=data_cfg
+    )
+    assert model.perception.encoder.n_spk == 8
+    assert len(model.speaker_token_ids) == 4
+
+    dataset_cfg = _speaker_data_cfg(8, sample_rate=16000, window_stride=0.01, subsampling_factor=8)
+    dataset_cfg.update({"sample_rate": 16000, "frame_length_in_secs": 0.08, "chunk_size": 2, "blank_token": "<blank>"})
+    dataset = StreamingSTTDataset(cfg=dataset_cfg, tokenizer=model.tokenizer)
+    assert dataset._num_speaker_tags == 4
+
+    previous = torch.get_default_device()
+    torch.set_default_device("cpu")
+    try:
+        audio = torch.randn(1, 16000) * 0.1
+        frames = 16000 // 160 // 8
+        with torch.no_grad():
+            embs, _ = model.perception(
+                input_signal=audio, input_signal_length=torch.tensor([16000]), spk_targets=torch.rand(1, frames, 8)
+            )
+    finally:
+        torch.set_default_device(previous)
+    assert torch.isfinite(embs).all()
+
+
+@pytest.mark.unit
+def test_streaming_stt_rejects_more_tags_than_columns(tmp_path, monkeypatch):
+    """`speaker_tokens.max_speakers` must not exceed `num_speakers`: a tag beyond the last target
+    column names a speaker the targets cannot describe."""
+    bundle = _write_toy_bundle_with_speakers(tmp_path / "pe.nemo", n_spk=4)
+    with pytest.raises(ValueError, match=r"max_speakers=8 exceeds .*num_speakers=4"):
+        _build_speaker_model(monkeypatch, bundle, max_speakers=8, data_cfg=_speaker_data_cfg(4))
+
+
+@pytest.mark.unit
+def test_streaming_stt_rejects_sentinel_mismatch(tmp_path, monkeypatch):
+    """The PE fills rows at or below its `missing_rttm_target` from the diarizer. A dataset writing
+    another sentinel would have those rows fused as real speaker activity."""
+    bundle = _write_toy_bundle_with_speakers(tmp_path / "pe.nemo", n_spk=4)
+    with pytest.raises(ValueError, match=r"missing_rttm_target=-1.0 .*missing_rttm_target=-2.0"):
+        _build_speaker_model(
+            monkeypatch, bundle, max_speakers=4, data_cfg=_speaker_data_cfg(4, missing_rttm_target=-2.0)
+        )
+    # Equal values on both sides construct.
+    bundle = _write_toy_bundle_with_speakers(tmp_path / "pe2.nemo", n_spk=4, missing_rttm_target=-2.0)
+    model = _build_speaker_model(
+        monkeypatch, bundle, max_speakers=4, data_cfg=_speaker_data_cfg(4, missing_rttm_target=-2.0)
+    )
+    assert model.perception.encoder.missing_rttm_target == -2.0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("data_cfg", ["absent", "disabled"])
+def test_speaker_guard_is_inert_without_multispeaker_data(tmp_path, monkeypatch, data_cfg):
+    """Without an enabled `multispeaker_cfg` no speaker targets reach the PE, so a width that
+    differs from the (unused) data setting is not an error, and inference/HF reload
+    (`data_cfg=None`) is unaffected."""
+    bundle = _write_toy_bundle_with_speakers(tmp_path / "pe.nemo", n_spk=4)
+    cfg = None if data_cfg == "absent" else _speaker_data_cfg(8, enable=False)
+    model = _build_speaker_model(monkeypatch, bundle, max_speakers=8, data_cfg=cfg)
+    assert model.perception.encoder.n_spk == 4
+
+
+@pytest.mark.unit
+def test_automodel_rejects_fusion_width_mismatch_after_mount(tmp_path, monkeypatch):
+    """The Automodel variant mounts the PE in `configure_model`, so its PE checks run there, against
+    the dataset configs given to `__init__`. The encoder-free check runs in `__init__`."""
+    import torch
+
+    from nemo.collections.speechlm2.models import StreamingSTTModelAutomodel
+    from tests.collections.speechlm2.test_streaming_stt_automodel import tiny_llm_factory
+    from tests.collections.speechlm2.test_streaming_stt_dynamic_diarizer import make_pe_cfg
+
+    bundle = _write_toy_bundle_with_speakers(tmp_path / "pe.nemo", n_spk=4)
+    speaker_tokens = {"enable": True, "template": "<spk:{i}>", "max_speakers": 4}
+    previous = torch.get_default_device()
+    torch.set_default_device("cpu")
+    tiny_llm_factory(monkeypatch)
+    try:
+        cfg = make_pe_cfg(pe_encoder_path=bundle, use_nemo_automodel=True, speaker_tokens=speaker_tokens)
+        with pytest.raises(ValueError, match=r"max_speakers=4 exceeds .*num_speakers=2"):
+            StreamingSTTModelAutomodel(cfg, data_cfg=_speaker_data_cfg(2))
+        model = StreamingSTTModelAutomodel(cfg, data_cfg=_speaker_data_cfg(8))
+        with pytest.raises(ValueError, match=r"n_spk=4 .*num_speakers=8"):
+            model.configure_model()
+    finally:
+        torch.set_default_device(previous)
