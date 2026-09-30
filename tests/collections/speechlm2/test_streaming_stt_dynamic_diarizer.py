@@ -646,3 +646,119 @@ def test_sentinel_rows_use_the_diarizer_on_both_decoders(monkeypatch, state_mach
     for call, (d, o, m) in enumerate(zip(diarizer, with_oracle, with_mixed)):
         assert torch.equal(m[1], d[1]), f"the sentinel row is not the diarizer's at perception call {call}"
         assert torch.equal(m[0], o[0]) and torch.equal(m[2], o[2]), f"a real row changed at call {call}"
+
+
+def _offline_perception_calls(model, spk_targets, via_generate):
+    """The kwargs and outputs of every perception call during one offline decode."""
+    audios, lengths = _unequal_length_audio()
+    calls = []
+    original = type(model.perception).forward
+
+    def spy(self, *args, **kwargs):
+        out = original(self, *args, **kwargs)
+        calls.append((dict(kwargs), out[0].detach().clone()))
+        return out
+
+    extra = {} if spk_targets is None else {"spk_targets": spk_targets}
+    type(model.perception).forward = spy
+    try:
+        with torch.no_grad():
+            if via_generate:
+                result = model.generate(
+                    audios=audios,
+                    audio_lens=torch.tensor(lengths),
+                    system_prompt="Transcribe the audio into text.",
+                    max_new_tokens=4,
+                    chunk_size_override=-1,
+                    **extra,
+                )
+            else:
+                model._ensure_inference_cache()  # what `generate` does before it dispatches
+                result = model._generate_offline(audios, lengths, "Transcribe the audio into text.", 4, **extra)
+    finally:
+        type(model.perception).forward = original
+    return calls, result
+
+
+def _random_targets(model, lengths, seed):
+    frames = math.ceil(max(lengths) / int(model._samples_per_encoder_frame()))
+    n_spk = model.perception.encoder.diarization_model.sortformer_modules.n_spk
+    return torch.rand(len(lengths), frames, n_spk, generator=torch.Generator().manual_seed(seed))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("via_generate", [False, True], ids=["_generate_offline", "generate"])
+def test_offline_decode_forwards_oracle_targets_to_perception(model_with_diarizer, via_generate):
+    """PF-8: the offline decoder (``chunk_size < 0``) must hand oracle targets to perception.
+
+    It used to drop them: ``generate`` did not pass ``spk_targets`` on, and ``_generate_offline``
+    did not accept them, so an oracle offline decode ran the embedded diarizer and reported its
+    numbers as oracle ones.
+    """
+    _, lengths = _unequal_length_audio()
+    targets = _random_targets(model_with_diarizer, lengths, seed=0)
+    calls, _ = _offline_perception_calls(model_with_diarizer, targets, via_generate)
+    assert len(calls) == 1, f"the offline decoder called perception {len(calls)} times"
+    kwargs, _ = calls[0]
+    assert kwargs.get("spk_targets") is targets, "the oracle targets did not reach perception"
+
+
+@pytest.mark.unit
+def test_offline_oracle_embeddings_match_the_training_path(monkeypatch):
+    """The offline decoder's oracle embeddings are exactly what training's perception call gives,
+    and different targets give different embeddings (the targets steer the fusion)."""
+    torch.manual_seed(0)
+    model = _build_model_with_diarizer(monkeypatch)
+    audios, lengths = _unequal_length_audio()
+    first, second = _random_targets(model, lengths, seed=0), _random_targets(model, lengths, seed=1)
+
+    def offline_embeddings(targets):
+        calls, _ = _offline_perception_calls(model, targets, via_generate=True)
+        assert len(calls) == 1
+        return calls[0][1]
+
+    embs_first = offline_embeddings(first)
+    embs_second = offline_embeddings(second)
+    embs_diarizer = offline_embeddings(None)
+    with torch.no_grad():
+        reference, _ = model.perception(
+            input_signal=audios, input_signal_length=torch.tensor(lengths), spk_targets=first
+        )
+    assert torch.equal(embs_first, reference)
+    assert not torch.equal(embs_first, embs_second), "which targets were given changed nothing"
+    assert not torch.equal(embs_first, embs_diarizer), "oracle targets decoded like the diarizer"
+
+
+@pytest.mark.unit
+def test_offline_decode_without_targets_is_unchanged(model_with_diarizer):
+    """Pin: without oracle targets, the offline decoder calls perception exactly as before, with no
+    ``spk_targets`` key, so the embedded diarizer runs."""
+    audios, lengths = _unequal_length_audio()
+    calls, _ = _offline_perception_calls(model_with_diarizer, None, via_generate=True)
+    assert len(calls) == 1
+    kwargs, embs = calls[0]
+    assert set(kwargs) == {"input_signal", "input_signal_length"}
+    with torch.no_grad():
+        reference, _ = model_with_diarizer.perception(input_signal=audios, input_signal_length=torch.tensor(lengths))
+    assert torch.equal(embs, reference)
+
+
+@pytest.mark.unit
+def test_offline_targets_are_ignored_by_a_plain_encoder(monkeypatch):
+    """Pin: a perception encoder that cannot consume ``spk_targets`` (a plain Conformer) decodes
+    offline exactly as without them, as in training and in the chunked decoder."""
+    from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel
+
+    _tiny_llm(monkeypatch)
+    torch.manual_seed(0)
+    model = StreamingSTTModel(make_pe_cfg())
+    model.configure_model()
+    model.eval()
+    audios, lengths = _unequal_length_audio()
+    targets = torch.rand(len(lengths), 32, 4, generator=torch.Generator().manual_seed(0))
+
+    calls_with, result_with = _offline_perception_calls(model, targets, via_generate=True)
+    calls_without, result_without = _offline_perception_calls(model, None, via_generate=True)
+    assert "spk_targets" not in calls_with[0][0]
+    assert torch.equal(calls_with[0][1], calls_without[0][1])
+    assert result_with.texts == result_without.texts

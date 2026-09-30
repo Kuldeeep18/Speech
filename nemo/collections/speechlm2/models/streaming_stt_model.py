@@ -2572,6 +2572,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
         system_prompt: Union[str, List[str]],
         max_new_tokens: int,
         generation_config: Optional[GenerationConfig] = None,
+        spk_targets: Optional[Tensor] = None,
         **generation_kwargs,
     ) -> StreamingSTTGenerateResult:
         """Offline generation: process entire audio in a single LLM forward pass.
@@ -2587,6 +2588,8 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             system_prompt: System prompt string (shared) or list of B per-sample prompts.
             max_new_tokens: Maximum tokens to generate per sample.
             generation_config: Optional HuggingFace ``GenerationConfig``.
+            spk_targets: Optional ``(B, T_frames, n_spk)`` oracle speaker targets on the
+                encoder-frame grid, passed to perception whole, as in training.
             generation_kwargs: Per-call overrides for generation parameters.
 
         Returns:
@@ -2622,11 +2625,17 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
             torch.tensor(self._user_footer_and_asst_header_ids, device=device, dtype=torch.long).unsqueeze(0)
         )  # (1, L_uf, H)
 
-        # 3. Run offline perception on the full batch
+        # 3. Run offline perception on the full batch. Oracle targets go in exactly as
+        #    `_build_input_embeds` passes them in training; without them a ParallelExpertEncoder
+        #    runs its embedded diarizer.
         audio_lens_t = torch.tensor(n_samples_list, device=device)
+        perception_kwargs = {}
+        if spk_targets is not None and self._perception_accepts_spk_targets():
+            perception_kwargs["spk_targets"] = spk_targets
         batch_audio_embs, batch_emb_lens = self.perception(
             input_signal=audios,
             input_signal_length=audio_lens_t,
+            **perception_kwargs,
         )  # (B, T_enc_max, H), (B,)
         batch_audio_embs = batch_audio_embs.type_as(self._embed_ref_tensor)
         all_audio_embs = [batch_audio_embs[b, : int(batch_emb_lens[b].item())] for b in range(B)]
@@ -3816,6 +3825,10 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                 start/end times derived from chunk emit positions. Default True.
             return_debug_logs: Populate ``result.debug_logs`` with per-frame
                 LM top-5, aux p_emit, and decision diagnostics. Expensive — opt-in.
+            spk_targets: Optional ``(B, T_frames, n_spk)`` oracle speaker targets on the
+                encoder-frame grid, used in place of a ParallelExpertEncoder's diarizer
+                predictions. The offline decoder (``chunk_size < 0``) passes them whole; the
+                streaming decoders pass each chunk its frame window.
             generation_kwargs: Per-call overrides for generation parameters.
 
         Returns:
@@ -3873,6 +3886,7 @@ class StreamingSTTModel(LightningModule, HFHubMixin):
                     system_prompt,
                     max_new_tokens,
                     generation_config,
+                    spk_targets=spk_targets,
                     **generation_kwargs,
                 )
             elif chunk_size == 0 or use_state_machine_inference:

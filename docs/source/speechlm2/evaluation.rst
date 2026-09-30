@@ -253,9 +253,13 @@ Oracle speaker targets
 ----------------------
 
 A model with a Parallel Expert Encoder can decode with oracle (RTTM-derived) speaker activity in
-place of its embedded diarizer's predictions: pass ``spk_targets`` to ``generate`` with a streaming
-decoder. ``streaming_stt_generate.py``'s ``oracle_spk_targets`` needs a dataloader that emits them,
-and refuses to run without them.
+place of its embedded diarizer's predictions: pass ``spk_targets`` to ``generate``. The offline and
+the streaming decoders use them. The streaming decoders give each chunk its window of the targets.
+The offline decoder (``chunk_size_override=-1``, or a model trained with ``chunk_size: -1``) gives
+perception the whole tensor, as training does: the encoder then takes its full-utterance path
+whatever the audio length, and fills sentinel rows (below) from its diarizer.
+``streaming_stt_generate.py``'s ``oracle_spk_targets`` needs a dataloader that emits them, and
+refuses to run without them.
 
 A cut without an RTTM carries the missing-RTTM sentinel (``missing_rttm_target``) across its whole
 row. In streaming decoding, as in training, such rows are filled from the embedded diarizer, row by
@@ -269,6 +273,12 @@ diarizer's streaming state would not have seen the start of the audio.
    Before this fill existed in the streaming step, streaming decoding fused a sentinel row as if
    nobody was speaking. Oracle streaming results on data that mixes cuts with and without an RTTM
    are affected on the rows without one; rerun them to compare.
+
+.. note::
+
+   Before this fix, the offline decoder dropped ``spk_targets``: it ran the embedded diarizer,
+   so an offline decode with oracle targets returned the diarizer's result instead. Rerun any
+   oracle numbers measured offline. Offline decodes without ``spk_targets`` are unchanged.
 
 Exported checkpoints with a Parallel Expert Encoder
 ---------------------------------------------------
