@@ -115,10 +115,13 @@ class StreamingSTTDataConfig:
     #     is 160 ms of new voice. It does let the tag condition the words that follow.
     #   'suffix' -- `words <spk:0> words <spk:1>`. Identity is decided after the whole turn
     #     has been heard, at the cost of losing that conditioning.
+    # Both are built from the words' `speaker_ids`, so prefix-format manifests serve either.
     speaker_tag_placement: str = 'prefix'
     # Optional content-free boundary marker opening each new speaker run, e.g. `<spk_switch>`.
     # Splits 'a speaker changed' from 'who it is' into two decisions. Costs one extra token
     # per run, which matters most where the emission budget is tight (low latency).
+    # suffix: `<spk_switch> words <spk:0> <spk_switch> words <spk:1>`;
+    # prefix: `<spk_switch><spk:0> words <spk_switch><spk:1> words`.
     speaker_switch_token: Optional[str] = None
     audio_tag: str = "<audio>"
     blank_token: str = "<blank>"
@@ -449,6 +452,79 @@ def get_llm_messages_for_sample(
     # from the group's FIRST word, so a speaker change on any later word of the group would be
     # silently swallowed and those words attributed to the wrong speaker.
     last_emitted_speaker: Optional[int] = None
+    # Suffix placement and the switch token cannot reuse the tags the transcript slice carries: the
+    # manifests are prefix-format, so a slice spanning a speaker change holds the NEXT run's opening
+    # tag where a suffix target needs the previous run's closing one, and a mid-group run opening
+    # would have no switch token. Those configurations render each group run by run instead.
+    render_per_run = bool(speaker_token_template) and (speaker_tag_placement == 'suffix' or bool(speaker_switch_token))
+    speaker_markup = _speaker_markup_pattern(speaker_token_template, speaker_switch_token) if render_per_run else None
+
+    def _render_speaker_runs(word_indices: list[int]) -> str:
+        """Render a group as maximal same-speaker runs, with tags taken from ``speaker_ids``.
+
+        Each run's text is its transcript slice with every speaker tag and switch token removed.
+        A run whose speaker differs from ``last_emitted_speaker`` is opened:
+
+        * prefix: ``<switch><spk:N>`` in front of the run;
+        * suffix: ``<switch>`` in front of the run, when a switch token is set.
+
+        Under suffix placement a run is closed with `` <spk:N>`` when the word after it (in the
+        next group, if the run reaches the group's end) belongs to another speaker. Runs of words
+        without a speaker are passed through unchanged and do not touch the state.
+        """
+        nonlocal last_emitted_speaker
+        runs = [[word_indices[0]]]
+        for i in word_indices[1:]:
+            if alignments[i].speaker == alignments[runs[-1][-1]].speaker:
+                runs[-1].append(i)
+            else:
+                runs.append([i])
+
+        # Raw text per run. A run reaches back to the previous run's end, so markup between the
+        # runs is kept; what precedes the first speaker tag of that gap stays with the earlier run.
+        pieces = []
+        prev_end = None
+        for run_i, run in enumerate(runs):
+            spans = (word_spans[run[0]], word_spans[run[-1]]) if word_spans and transcript else (None, None)
+            if spans[0] is None or spans[1] is None:
+                pieces.append((" " if run_i else "") + " ".join(alignments[i].text for i in run))
+                prev_end = None
+                continue
+            start = spans[0][0]
+            if prev_end is not None:
+                start = prev_end
+                boundary = speaker_markup.search(transcript, prev_end, spans[0][0])
+                if boundary is not None:
+                    pieces[-1] += transcript[prev_end : boundary.start()]
+                    start = boundary.start()
+            pieces.append(transcript[start : spans[1][1]])
+            prev_end = spans[1][1]
+
+        out = ""
+        for run_i, (run, piece) in enumerate(zip(runs, pieces)):
+            speaker = alignments[run[0]].speaker
+            if speaker is None:
+                out += piece
+                continue
+            piece = speaker_markup.sub("", piece)
+            opener = ""
+            if speaker != last_emitted_speaker:
+                if speaker_tag_placement == 'suffix':
+                    opener = speaker_switch_token or ""
+                else:
+                    opener = f"{speaker_switch_token or ''}{speaker_token_template.format(i=speaker)}"
+            if opener:
+                piece = f"{opener}{piece}" if piece.startswith((" ", "\t")) else f"{opener} {piece}"
+                if run_i:
+                    piece = f" {piece}"
+            if speaker_tag_placement == 'suffix':
+                nxt = run[-1] + 1
+                # Close the run only when it actually ends here -- otherwise the next group continues it.
+                if nxt >= len(alignments) or alignments[nxt].speaker != speaker:
+                    piece = f"{piece} {speaker_token_template.format(i=speaker)}"
+            last_emitted_speaker = speaker
+            out += piece
+        return out
 
     def _apply_speaker_tag(content: str, word_indices: list[int]) -> str:
         """Prepend `<spk:N>` to a group's content when the speaker changed, and update state.
@@ -462,30 +538,17 @@ def get_llm_messages_for_sample(
 
         So ``last_emitted_speaker`` must track the group's **last** word, not its first: a group
         may end on a different speaker than it began, via a mid-group tag the slice already carried.
+
+        This holds for prefix placement without a switch token only. Suffix placement and the
+        switch token rebuild the group run by run (``_render_speaker_runs``), ignoring ``content``.
         """
         nonlocal last_emitted_speaker
         if not speaker_token_template or not word_indices:
             return content
+        if render_per_run:
+            return _render_speaker_runs(word_indices)
         first_speaker = alignments[word_indices[0]].speaker
         last_speaker = alignments[word_indices[-1]].speaker
-
-        if speaker_tag_placement == 'suffix':
-            # Mirror image of the prefix case. `compute_word_spans` spans first-word-start to
-            # last-word-end, so a tag sitting AFTER the group's last word falls outside the slice
-            # and must be added here; tags for runs that END mid-group come free in the slice.
-            out = content
-            if speaker_switch_token and first_speaker is not None and first_speaker != last_emitted_speaker:
-                out = (
-                    f"{speaker_switch_token}{out}" if out.startswith((" ", "\t")) else f"{speaker_switch_token} {out}"
-                )
-            nxt = word_indices[-1] + 1
-            next_speaker = alignments[nxt].speaker if nxt < len(alignments) else None
-            # Close the run only when it actually ends here -- otherwise the next group continues it.
-            if last_speaker is not None and next_speaker != last_speaker:
-                out = f"{out} {speaker_token_template.format(i=last_speaker)}"
-            if last_speaker is not None:
-                last_emitted_speaker = last_speaker
-            return out
 
         if first_speaker is not None and first_speaker != last_emitted_speaker:
             tag = speaker_token_template.format(i=first_speaker)
@@ -609,6 +672,8 @@ def get_llm_messages_for_sample(
             messages.append({"role": "user", "content": flush_token})
             if residual_indices:
                 content = _content_for_words(residual_indices, alignments, word_spans, transcript)
+                # Like every other assistant turn, the flush turn opens with the tag of a run it starts.
+                content = _apply_speaker_tag(content, residual_indices)
                 if prepend_write_token and write_token:
                     content = write_token + content
                 messages.append({"role": "assistant", "content": content})
@@ -1903,6 +1968,15 @@ def _assert_prefix(longer: list[int], shorter: list[int], hf_tok, what: str) -> 
             f"Chat template for {name!r} is not append-only: {what}. "
             f"parse_chat_template_ids cannot derive turn spans for this template."
         )
+
+
+def _speaker_markup_pattern(template: str, switch_token: Optional[str]) -> "re.Pattern[str]":
+    """Match any speaker tag rendered from ``template``, or the switch token, with the whitespace before it."""
+    head, sep, tail = template.partition("{i}")
+    alternatives = [re.escape(head) + r"\d+" + re.escape(tail) if sep else re.escape(template)]
+    if switch_token:
+        alternatives.append(re.escape(switch_token))
+    return re.compile(r"\s*(?:" + "|".join(alternatives) + ")")
 
 
 def _content_for_words(

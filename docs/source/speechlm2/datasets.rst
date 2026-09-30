@@ -854,6 +854,54 @@ This dataset class is specialized for the DuplexSTTModel, which processes duplex
         output_roles=["Assistant"],                  # Roles to generate text for
     )
 
+StreamingSTTDataset speaker tags
+********************************
+
+With ``multispeaker_cfg`` enabled, ``StreamingSTTDataset`` supervises serialized output training (SOT) targets:
+the assistant turns carry a speaker tag (``<spk:N>`` by default) wherever the speaker changes. The manifests keep
+their prefix-format text (``<spk:0> a b <spk:1> c d``); the speaker of every word comes from the manifest's
+``speaker_ids``, aligned with its ``alignments`` (see ``scripts/speechlm2/align_manifest.py``). Three data options
+shape the tags:
+
+- ``speaker_tag_placement: prefix`` (default) puts the tag in front of the first word of each speaker run.
+- ``speaker_tag_placement: suffix`` puts the tag after the last word of each run, so the model names the
+  speaker only after hearing the whole run.
+- ``speaker_switch_token`` (for example ``<spk_switch>``, also registered through
+  ``model.speaker_tokens.switch_token``) adds a content-free marker in front of every run.
+
+For the words ``a b`` of speaker 0 and ``c d`` of speaker 1, all in one chunk, the assistant content is:
+
+.. list-table::
+   :header-rows: 1
+
+   * - placement
+     - no switch token
+     - with ``<spk_switch>``
+   * - prefix
+     - ``<spk:0> a b <spk:1> c d``
+     - ``<spk_switch><spk:0> a b <spk_switch><spk:1> c d``
+   * - suffix
+     - ``a b <spk:0> c d <spk:1>``
+     - ``<spk_switch> a b <spk:0> <spk_switch> c d <spk:1>``
+
+When the words fall into different chunks, each chunk's turn carries the tags of the runs it opens (prefix) or
+closes (suffix); a run that continues into the next chunk is not tagged again. With ``use_flush_token``, the turn
+after the flush token follows the same rules, so it opens with the tag of a run it starts.
+
+.. note::
+
+   Earlier versions built these targets incorrectly in three cases, so recipes that use them now train on
+   different targets. Recipes with prefix placement, no switch token and no flush token are unaffected.
+
+   - **Suffix placement:** a chunk that spanned a speaker change carried the next run's prefix tag, so its
+     words were attributed to the wrong speaker (``a b <spk:1> c d <spk:1>``).
+   - **Switch token:** under prefix placement it was ignored; under suffix placement it was missing inside a
+     chunk that spanned a change.
+   - **Flush turn:** it dropped the tag of a run it opened.
+
+   Results of models trained with suffix placement or a switch token before this fix should be re-measured
+   before they are compared with prefix models.
+
 DataModule
 ----------
 
