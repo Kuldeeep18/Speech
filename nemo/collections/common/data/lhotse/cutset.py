@@ -67,10 +67,10 @@ def temperature_reweighting(weights: List[Union[float, int]], temperature: float
 
     Args:
         weights: List of dataset weights (can be hours, sample counts, or probabilities).
-                 Values can be any positive float/int, not limited to [0, 1].
+                 Values must be nonnegative, with at least one positive value. Zeros remain disabled.
         temperature: Scaling factor.
                      - 1.0: preserves original weight ratios
-                     - 0.0: equalizes all weights (w^0 = 1)
+                     - 0.0: equalizes positive weights; zero weights remain zero
                      - <1.0: oversamples smaller datasets
                      - >1.0: amplifies weight differences
 
@@ -86,9 +86,13 @@ def temperature_reweighting(weights: List[Union[float, int]], temperature: float
     if len(weights) == 0:
         return []
     weights = np.asarray(weights)
-    if np.any(weights <= 0):
-        raise ValueError(f"All weights must be positive (> 0), got: {weights.tolist()}")
-    weights = weights**temperature
+    positive = weights > 0
+    if np.any(weights < 0) or not np.any(positive):
+        raise ValueError(f"Weights must be nonnegative with at least one positive value, got: {weights.tolist()}")
+    # Keep disabled graph slots addressable for saved packing-buffer origins.
+    # They must remain disabled even when temperature=0 (where 0**0 is 1).
+    weights = np.where(positive, weights, 1) ** temperature
+    weights[~positive] = 0
     return (weights / weights.sum()).tolist()
 
 

@@ -548,6 +548,23 @@ class SpectrogramAugmentation(NeuralModule):
         else:
             self.spec_augment_numba = None
 
+    def configure_short_recording_time_mask_cap(
+        self,
+        *,
+        frame_duration_seconds: float,
+        max_duration_seconds: float = 1.0,
+        max_mask_fraction: float = 0.1,
+    ) -> None:
+        """Limit aggregate time masking on sub-threshold recordings."""
+        if isinstance(self.spec_augment, SpecAugment):
+            self.spec_augment.configure_short_recording_time_mask_cap(
+                frame_duration_seconds=frame_duration_seconds,
+                max_duration_seconds=max_duration_seconds,
+                max_mask_fraction=max_mask_fraction,
+            )
+            # The Numba kernel does not support row-specific mask limits.
+            self.spec_augment_numba = None
+
     @typecheck()
     def forward(self, input_spec, length):
         augmented_spec = self.spec_cutout(input_spec=input_spec)
