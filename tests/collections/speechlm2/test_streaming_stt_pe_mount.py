@@ -439,6 +439,67 @@ def test_speaker_guard_is_inert_without_multispeaker_data(tmp_path, monkeypatch,
     assert model.perception.encoder.n_spk == 4
 
 
+class _ToyForcedAligner:
+    """Stands in for the online forced aligner a checkpoint saves among its hyper-parameters."""
+
+    def align(self, audio, audio_lens, texts):
+        return [[] for _ in texts]
+
+
+@pytest.mark.unit
+def test_load_from_checkpoint_checks_the_saved_dataset_configs(tmp_path, monkeypatch):
+    """Lightning's `load_from_checkpoint` restores the `data_cfg` and `val_data_cfg` saved in a
+    checkpoint, so the guard runs on them: an older checkpoint whose `multispeaker_cfg` still has the
+    retired `no_rttm_to_ones` key is refused, also when only one of the two is overridden. Overriding
+    both with `None` skips the guard and loads the same weights. A checkpoint trained with online
+    forced alignment restores its aligner too, which needs a dataset config, so it needs
+    `forced_aligner=None` as well."""
+    import lightning
+    import torch
+
+    from nemo.collections.speechlm2.models.streaming_stt_model import StreamingSTTModel
+
+    bundle = _write_toy_bundle_with_speakers(tmp_path / "pe.nemo", n_spk=8)
+    reference = _build_speaker_model(monkeypatch, bundle, max_speakers=4)
+    retired = _speaker_data_cfg(8, no_rttm_to_ones=True)
+    hyper_parameters = {"cfg": reference.hparams["cfg"], "data_cfg": retired, "val_data_cfg": retired}
+    ckpt, fa_ckpt = tmp_path / "step=1.ckpt", tmp_path / "fa-step=1.ckpt"
+    for path, extra in ((ckpt, {}), (fa_ckpt, {"forced_aligner": _ToyForcedAligner()})):
+        torch.save(
+            {
+                "state_dict": reference.state_dict(),
+                "hyper_parameters": {**hyper_parameters, **extra},
+                "pytorch-lightning_version": lightning.pytorch.__version__,
+            },
+            path,
+        )
+
+    refused = r"multispeaker_cfg\.no_rttm_to_ones was removed"
+    previous = torch.get_default_device()
+    torch.set_default_device("cpu")
+    try:
+        with pytest.raises(ValueError, match=refused):
+            StreamingSTTModel.load_from_checkpoint(ckpt, map_location="cpu")
+        with pytest.raises(ValueError, match=refused):
+            StreamingSTTModel.load_from_checkpoint(ckpt, map_location="cpu", data_cfg=None)
+        with pytest.raises(ValueError, match=refused):
+            StreamingSTTModel.load_from_checkpoint(ckpt, map_location="cpu", val_data_cfg=None)
+        loaded = StreamingSTTModel.load_from_checkpoint(ckpt, map_location="cpu", data_cfg=None, val_data_cfg=None)
+        skip = {"map_location": "cpu", "data_cfg": None, "val_data_cfg": None}
+        with pytest.raises(AssertionError, match="Dataset config is required for online forced alignment"):
+            StreamingSTTModel.load_from_checkpoint(fa_ckpt, **skip)
+        without_aligner = StreamingSTTModel.load_from_checkpoint(fa_ckpt, forced_aligner=None, **skip)
+    finally:
+        torch.set_default_device(previous)
+    assert loaded.hparams["data_cfg"] is None and loaded.hparams["val_data_cfg"] is None
+    assert without_aligner.forced_aligner is None
+    expected = reference.state_dict()
+    for actual in (loaded.state_dict(), without_aligner.state_dict()):
+        assert set(actual) == set(expected)
+        for key, value in expected.items():
+            assert torch.equal(actual[key], value), key
+
+
 @pytest.mark.unit
 def test_automodel_rejects_fusion_width_mismatch_after_mount(tmp_path, monkeypatch):
     """The Automodel variant mounts the PE in `configure_model`, so its PE checks run there, against
@@ -463,3 +524,54 @@ def test_automodel_rejects_fusion_width_mismatch_after_mount(tmp_path, monkeypat
             model.configure_model()
     finally:
         torch.set_default_device(previous)
+
+
+@pytest.mark.unit
+def test_automodel_load_from_checkpoint_runs_the_encoder_checks(tmp_path, monkeypatch):
+    """`load_from_checkpoint` calls the Automodel variant's `configure_model()` before it loads the
+    weights, so the PE checks there also run on the saved dataset configs. Four tags fit configs with 8
+    speaker columns, so `__init__` accepts them; the mounted 4-speaker PE refuses them, also when only
+    one of the two is overridden. Overriding both with `None` loads the same weights."""
+    import lightning
+    import torch
+
+    from nemo.collections.speechlm2.models import StreamingSTTModelAutomodel
+    from tests.collections.speechlm2.test_streaming_stt_automodel import tiny_llm_factory
+    from tests.collections.speechlm2.test_streaming_stt_dynamic_diarizer import make_pe_cfg
+
+    bundle = _write_toy_bundle_with_speakers(tmp_path / "pe.nemo", n_spk=4)
+    speaker_tokens = {"enable": True, "template": "<spk:{i}>", "max_speakers": 4}
+    eight = _speaker_data_cfg(8)
+    ckpt = tmp_path / "step=1.ckpt"
+    refused = r"n_spk=4 .*num_speakers=8"
+    previous = torch.get_default_device()
+    torch.set_default_device("cpu")
+    tiny_llm_factory(monkeypatch)
+    try:
+        cfg = make_pe_cfg(pe_encoder_path=bundle, use_nemo_automodel=True, speaker_tokens=speaker_tokens)
+        reference = StreamingSTTModelAutomodel(cfg)
+        reference.configure_model()
+        torch.save(
+            {
+                "state_dict": reference.state_dict(),
+                "hyper_parameters": {"cfg": reference.hparams["cfg"], "data_cfg": eight, "val_data_cfg": eight},
+                "pytorch-lightning_version": lightning.pytorch.__version__,
+            },
+            ckpt,
+        )
+        with pytest.raises(ValueError, match=refused):
+            StreamingSTTModelAutomodel.load_from_checkpoint(ckpt, map_location="cpu")
+        with pytest.raises(ValueError, match=refused):
+            StreamingSTTModelAutomodel.load_from_checkpoint(ckpt, map_location="cpu", data_cfg=None)
+        with pytest.raises(ValueError, match=refused):
+            StreamingSTTModelAutomodel.load_from_checkpoint(ckpt, map_location="cpu", val_data_cfg=None)
+        loaded = StreamingSTTModelAutomodel.load_from_checkpoint(
+            ckpt, map_location="cpu", data_cfg=None, val_data_cfg=None
+        )
+    finally:
+        torch.set_default_device(previous)
+    assert loaded.hparams["data_cfg"] is None and loaded.hparams["val_data_cfg"] is None
+    expected, actual = reference.state_dict(), loaded.state_dict()
+    assert set(actual) == set(expected)
+    for key, value in expected.items():
+        assert torch.equal(actual[key], value), key

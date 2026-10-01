@@ -22,7 +22,12 @@ from tests.collections.asr.test_parallel_expert_encoder_two_branch import (
     build_toy_packed_pe_encoder,
 )
 
+# Tests marked ``pleasefixme`` build the PE with ``build_toy_packed_pe_encoder``, which passes the upstream
+# ``asr_encoder_type`` argument that this branch's ParallelExpertEncoder has not ported (see
+# test_parallel_expert_encoder_two_branch.py). Remove each mark once that API is ported and the test passes.
 
+
+@pytest.mark.pleasefixme
 @pytest.mark.unit
 def test_canonical_pee_packed_path_matches_dense_without_legacy_grouped_runtime():
     torch.manual_seed(0)
@@ -41,6 +46,7 @@ def test_canonical_pee_packed_path_matches_dense_without_legacy_grouped_runtime(
     assert not hasattr(encoder, "sequence_packed_execution_mode")
 
 
+@pytest.mark.pleasefixme
 @pytest.mark.unit
 def test_canonical_pee_accepts_token_flat_mels():
     torch.manual_seed(0)

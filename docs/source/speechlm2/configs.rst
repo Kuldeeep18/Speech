@@ -554,9 +554,18 @@ When the model is built with a dataset config whose ``multispeaker_cfg`` is enab
   diarizer.
 
 The validation dataset config is checked the same way. ``StreamingSTTModelAutomodel`` runs the
-encoder checks in ``configure_model()``, after it mounts the encoder. Without a dataset config
-(inference, or a reload from a checkpoint or HF export) nothing is compared. The dataset requires
+encoder checks in ``configure_model()``, after it mounts the encoder. The dataset requires
 ``<spk:0>`` to be a single token and logs how many consecutive tags are registered.
+
+Without a dataset config nothing is compared: ``from_pretrained`` (an HF export, as
+``streaming_stt_generate.py`` loads one) and ``streaming_stt_to_hf.py`` build the model from its
+model config alone. Lightning's ``load_from_checkpoint`` restores the ``data_cfg`` and
+``val_data_cfg`` saved in the checkpoint, so it runs the checks on them and refuses, for example,
+an older checkpoint whose ``multispeaker_cfg`` still has the retired ``no_rttm_to_ones`` key. To
+skip the checks, pass both ``data_cfg=None`` and ``val_data_cfg=None``; with only one, the other
+config is still checked. A checkpoint trained with online forced alignment also needs
+``forced_aligner=None``, because the saved aligner is restored too and online forced alignment
+requires a dataset config.
 
 Data Parameters
 ^^^^^^^^^^^^^^^
