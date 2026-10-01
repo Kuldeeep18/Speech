@@ -397,6 +397,46 @@ class TestASRModulesBasicTests:
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     @pytest.mark.unit
+    @pytest.mark.parametrize("use_vectorized_code", [False, True])
+    @pytest.mark.parametrize("time_width", [12, 0.15])
+    def test_short_cap_preserves_mixed_batch_long_rows_and_rng(self, use_vectorized_code, time_width):
+        baseline = modules.SpectrogramAugmentation(
+            freq_masks=2,
+            freq_width=2,
+            time_masks=10,
+            time_width=time_width,
+            use_vectorized_spec_augment=use_vectorized_code,
+            rng=random.Random(17),
+        )
+        capped = copy.deepcopy(baseline)
+        capped.configure_short_recording_time_mask_cap(frame_duration_seconds=0.01)
+        lengths = torch.tensor([50, 120, 1, 120])
+        features = torch.ones(4, 8, 120)
+
+        torch.manual_seed(23)
+        expected = baseline(input_spec=features.clone(), length=lengths)
+        baseline_torch_rng = torch.get_rng_state()
+        baseline_python_rng = baseline.spec_augment._rng.getstate()
+        torch.manual_seed(23)
+        actual = capped(input_spec=features.clone(), length=lengths)
+
+        torch.testing.assert_close(actual[[1, 3]], expected[[1, 3]], rtol=0, atol=0)
+        assert capped.spec_augment._rng.getstate() == baseline_python_rng
+        assert torch.equal(torch.get_rng_state(), baseline_torch_rng)
+        assert (actual[0, :, :50] == 0).all(dim=0).sum().item() <= 5
+        assert (actual[2, :, :1] == 0).all(dim=0).sum().item() == 0
+
+        # A later batch must also see precisely the uncapped RNG state.
+        next_features = torch.ones(1, 8, 120)
+        next_lengths = torch.tensor([120])
+        torch.set_rng_state(baseline_torch_rng)
+        expected_next = baseline(input_spec=next_features.clone(), length=next_lengths)
+        torch.set_rng_state(baseline_torch_rng)
+        actual_next = capped(input_spec=next_features.clone(), length=next_lengths)
+        torch.testing.assert_close(actual_next, expected_next, rtol=0, atol=0)
+        assert capped.spec_augment._rng.getstate() == baseline.spec_augment._rng.getstate()
+
+    @pytest.mark.unit
     def test_SpectrogramAugmentation_packed_short_recording_cap(self):
         augment = modules.SpectrogramAugmentation(time_masks=10, time_width=12)
         augment.configure_short_recording_time_mask_cap(

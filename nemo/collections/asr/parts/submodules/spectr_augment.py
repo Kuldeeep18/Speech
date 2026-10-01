@@ -203,11 +203,14 @@ class SpecAugment(nn.Module, Typing):
             else:
                 time_width_limits = [time_width_limits] * self.time_masks
 
-            # Set time masking
+            # Draw with the historical bounds even for capped short rows.
+            # randint uses rejection sampling, so changing its bounds would shift
+            # the RNG state for later rows and subsequent batches.
+            time_start_upper_bound = max(1, lengths_cpu[idx] - time_max_width)
             for mask_idx in range(self.time_masks):
-                mask_width_limit = int(time_width_limits[mask_idx])
-                start = self._rng.randint(0, max(1, lengths_cpu[idx] - mask_width_limit))
-                width = self._rng.randint(0, mask_width_limit)
+                start = self._rng.randint(0, time_start_upper_bound)
+                width = self._rng.randint(0, time_max_width)
+                width = min(width, int(time_width_limits[mask_idx]))
                 fill_mask[idx, :, start : start + width] = True
         # Bring the mask to device and fill spec
         fill_mask = torch.from_numpy(fill_mask).to(input_spec.device)

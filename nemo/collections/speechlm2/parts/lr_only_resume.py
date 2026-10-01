@@ -9,7 +9,10 @@ class ScaleRestoredLearningRate(Callback):
     """Scale the restored cosine schedule once, preserving all other state.
 
     The callback state is checkpointed so later segments of the new experiment
-    resume without applying the scale a second time.
+    resume without applying the scale a second time. Keep the callback configuration
+    unchanged on subsequent resumes. The first full-state restore must use a
+    canonical ``/step=<source_step>.ckpt`` path; see the SpeechLM training guide's
+    "Reducing LR After a Full-State Resume" section for configuration examples.
     """
 
     def __init__(self, factor: float, source_step: int, original_base_lr: float, original_min_lr: float):
