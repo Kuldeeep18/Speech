@@ -67,6 +67,39 @@ Configuration Files
 
 The main configuration file (``s2s_training.yaml``) contains all model, training, and data parameters. See :doc:`configs` for more details. It's recommended to copy and modify this file rather than overriding options in the SLURM script to maintain versioning and configuration clarity.
 
+Short-Recording SpecAugment
+---------------------------
+
+SpeechLM perception modules automatically cap aggregate time masking at 10% of
+valid frames for recordings shorter than one second. The threshold uses the
+frontend's frame duration. This policy supports dense and packed PyTorch
+SpecAugment; long recordings retain their existing masks and RNG behavior.
+
+The Numba backend does not support this cap. Enabling the policy overrides
+``use_numba_spec_augment: true`` with PyTorch SpecAugment and logs a warning,
+including when restoring a checkpoint. The vectorized PyTorch implementation
+is independent of Numba and remains available through
+``use_vectorized_spec_augment: true``. Set ``use_numba_spec_augment: false``
+explicitly in the model's ``spec_augment`` configuration to select this backend
+without the override warning.
+
+For a restored Numba experiment, the backend switch may change RNG behavior,
+outputs and throughput, including for batches containing only long recordings.
+The long-recording preservation guarantee applies relative to the selected
+PyTorch implementation. Outside SpeechLM, enabling the cap through
+``SpectrogramAugmentation.configure_short_recording_time_mask_cap`` has the
+same behavior; Numba augmentation without the cap remains supported.
+
+Zero-Weight Dataset Sources
+---------------------------
+
+Zero-weight sources remain disabled at every reweighting temperature, including
+zero. Infinite training mixtures retain disabled source slots for restored
+packing-buffer origins. Finite mixtures (``force_finite: true`` or
+``metadata_only: true``) omit disabled slots and stop when all positive-weight
+sources are exhausted. Retain the infinite mixture's source layout when
+resuming its saved data state.
+
 .. _speechlm-lr-only-continuation:
 
 Reducing LR After a Full-State Resume

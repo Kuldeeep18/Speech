@@ -1925,13 +1925,22 @@ def mux(
 ) -> CutSet:
     """
     Helper function to call the right multiplexing method flavour in lhotse.
-    The result is always an infinitely iterable ``CutSet``, but depending on whether ``max_open_streams`` is set,
-    it will select a more appropriate multiplexing strategy.
+    Unless ``force_finite`` is set, the result is infinitely iterable. ``max_open_streams`` selects
+    the multiplexing strategy. Finite mixtures omit disabled sources so iteration stops after all
+    positive-weight sources are exhausted; infinite mixtures retain source slots for graph restoration.
     """
     if max_open_streams is not None:
         assert not force_finite, "max_open_streams and metadata_only/force_finite options are not compatible"
         cuts = CutSet.infinite_mux(*cutsets, weights=weights, seed=seed, max_open_streams=max_open_streams)
     else:
+        if force_finite and weights is not None:
+            # Lhotse's finite mux otherwise keeps disabled sources active after
+            # all positive-weight sources end, then samples an all-zero mixture.
+            enabled = [(cs, weight) for cs, weight in zip(cutsets, weights) if weight > 0]
+            if not enabled:
+                raise ValueError("Finite mixtures require at least one positive weight.")
+            cutsets, weights = zip(*enabled)
+            weights = list(weights)
         if not force_finite:
             cutsets = [cs.repeat(preserve_id=True) for cs in cutsets]
         if len(cutsets) == 1:

@@ -471,6 +471,45 @@ class TestASRModulesBasicTests:
             augment.configure_short_recording_time_mask_cap(**kwargs)
 
     @pytest.mark.unit
+    @pytest.mark.parametrize("numba_available", [False, True])
+    @pytest.mark.parametrize("use_vectorized_code", [False, True])
+    def test_short_recording_cap_logs_numba_fallback_and_preserves_pytorch_behavior(
+        self, monkeypatch, caplog, numba_available, use_vectorized_code
+    ):
+        from nemo.collections.asr.modules import audio_preprocessing
+
+        monkeypatch.setattr(audio_preprocessing, "NUMBA_CUDA_AVAILABLE", numba_available)
+        # Exercise backend selection on CPU without launching a CUDA kernel.
+        monkeypatch.setattr(audio_preprocessing, "SpecAugmentNumba", lambda **kwargs: torch.nn.Identity())
+        monkeypatch.setattr(logging._logger, "propagate", True)
+        kwargs = {
+            "time_masks": 10,
+            "time_width": 12,
+            "use_vectorized_spec_augment": use_vectorized_code,
+        }
+        augment = modules.SpectrogramAugmentation(**kwargs, use_numba_spec_augment=True, rng=random.Random(17))
+        baseline = modules.SpectrogramAugmentation(**kwargs, rng=random.Random(17))
+        assert (augment.spec_augment_numba is not None) == numba_available
+
+        augment.configure_short_recording_time_mask_cap(frame_duration_seconds=0.01)
+
+        assert "overriding use_numba_spec_augment=True" in caplog.text
+        assert augment.spec_augment_numba is None
+        lengths = torch.tensor([50, 120, 1])
+        features = torch.ones(3, 8, 120)
+        torch.manual_seed(23)
+        expected = baseline(input_spec=features.clone(), length=lengths)
+        baseline_torch_rng = torch.get_rng_state()
+        torch.manual_seed(23)
+        actual = augment(input_spec=features.clone(), length=lengths)
+
+        torch.testing.assert_close(actual[1], expected[1], rtol=0, atol=0)
+        assert torch.equal(torch.get_rng_state(), baseline_torch_rng)
+        assert augment.spec_augment._rng.getstate() == baseline.spec_augment._rng.getstate()
+        assert (actual[0, :, :50] == 0).all(dim=0).sum().item() <= 5
+        assert (actual[2, :, :1] == 0).all(dim=0).sum().item() == 0
+
+    @pytest.mark.unit
     def test_SpectrogramAugmentation_packed_cutout_preserves_frontend_padded_rng_range(self):
         preprocessor = modules.AudioToMelSpectrogramPreprocessor(
             features=8, normalize=None, dither=0, pad_to=16
