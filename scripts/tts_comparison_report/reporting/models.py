@@ -511,8 +511,9 @@ class BucketData:
                 context=validation_context,
             )
             if math.isnan(value):
+                sample = item.get("pred_audio_filepath", "<unknown sample>")
                 raise ValueError(
-                    f"Metric '{metric_name}' in {validation_context} contains NaN; "
+                    f"Metric '{metric_name}' in {validation_context} contains NaN for sample '{sample}'; "
                     "statistical tests and box plots require non-NaN samples."
                 )
             output.append(value)
