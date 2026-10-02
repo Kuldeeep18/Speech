@@ -435,8 +435,8 @@ def setup_parallel_expert_encoder(model: torch.nn.Module, *, streaming: bool = F
 
         preprocessor -> encoder -> modality_adapter -> proj
 
-    The replacement expects un-normalised mels and applies ASR normalisation
-    internally, so the outer perception preprocessor
+    The replacement expects un-normalised mels and applies the ASR normalisation, and the
+    diarizer's (``diar_normalize_type``), internally, so the outer perception preprocessor
     normalisation is disabled when the bundle is mounted.
 
     ``model.pe_encoder_path`` loads a bundle ``.nemo`` with its weights. ``model.pe_encoder_config`` is
@@ -448,9 +448,12 @@ def setup_parallel_expert_encoder(model: torch.nn.Module, *, streaming: bool = F
         model: The model whose ``perception.encoder`` is replaced.
         streaming: Mount a :class:`StreamingParallelExpertEncoder`, for models that decode chunk by
             chunk (StreamingSTT). The bundle's weights and offline forward are the same for both
-            classes; the streaming class only adds the cache-aware streaming interface. ``False``
-            (SALM) loads through :class:`ParallelExpertEncoderPT` as before, which mounts a local
-            ``.nemo`` as the plain :class:`ParallelExpertEncoder`.
+            classes: both normalise the diarizer input as the diarizer's own preprocessor did, unless
+            ``diar_normalize_type`` (in the bundle config or ``model.pe_encoder_overrides``) overrides
+            it. The streaming class adds the cache-aware streaming interface, whose step applies that
+            normalisation to each chunk on its own. ``False`` (SALM) loads through
+            :class:`ParallelExpertEncoderPT` as before, which mounts a local ``.nemo`` as the plain
+            :class:`ParallelExpertEncoder`.
     """
     if not has_parallel_expert_encoder_bundle(model.cfg):
         return
@@ -630,7 +633,9 @@ def setup_parallel_expert_encoder_from_checkpoints(model: torch.nn.Module):
 
     ``asr_normalize_type: auto`` is resolved from the ASR checkpoint's preprocessor, and the resolved
     value (``'NA'`` for no normalization) replaces ``auto`` in ``model.cfg`` and in the saved
-    hyperparameters, so a checkpoint or export reloads with the value it was trained with.
+    hyperparameters, so a checkpoint or export reloads with the value it was trained with. The
+    encoder's effective ``diar_normalize_type`` is written there the same way, because unset it
+    follows the diarizer checkpoint's own ``preprocessor.normalize``, which may change.
     """
     cfg = model.cfg.get("parallel_expert_encoder", None)
     if not cfg:
@@ -675,14 +680,15 @@ def setup_parallel_expert_encoder_from_checkpoints(model: torch.nn.Module):
     mount_parallel_expert_encoder(model, pe_encoder, source=f"{asr_model} + {diar_model}")
     if _is_auto_normalize(kwargs.get("asr_normalize_type", None)):
         _persist_resolved_asr_normalize_type(model, pe_encoder.asr_normalize_type)
+    _persist_effective_diar_normalize_type(model, pe_encoder.diar_normalize_type)
 
 
 def mount_parallel_expert_encoder(model: torch.nn.Module, pe_encoder, source: str):
     """Swap ``pe_encoder`` in as ``model.perception.encoder``, with compatibility checks.
 
-    Shared by the bundle and two-checkpoint paths. The PE encoder expects un-normalised mels for
-    its Sortformer branch and replays ASR normalisation internally, so the outer perception
-    preprocessor normalisation is disabled here.
+    Shared by the bundle and two-checkpoint paths. The PE encoder expects un-normalised mels and
+    replays the ASR normalisation, and the diarizer's (``diar_normalize_type``), internally, so the
+    outer perception preprocessor normalisation is disabled here.
     """
     pe_encoder_path = source
     existing_encoder = model.perception.encoder
@@ -805,6 +811,28 @@ def _persist_resolved_asr_normalize_type(model: torch.nn.Module, resolved) -> No
     logging.info("Persisted parallel_expert_encoder.asr_normalize_type=%r (resolved from 'auto').", persisted)
 
 
+def _persist_effective_diar_normalize_type(model: torch.nn.Module, effective) -> None:
+    """Write the mounted encoder's effective ``diar_normalize_type`` to ``parallel_expert_encoder``.
+
+    Unset, the encoder follows the diarizer checkpoint's ``preprocessor.normalize``, so a reload after that
+    checkpoint changed would otherwise feed the diarizer other input than training did. Written like a resolved
+    ``asr_normalize_type: auto``: to ``model.cfg`` and to the saved hyperparameters (an updated copy, not the
+    caller's ``cfg`` edited in place), ``'NA'`` for none.
+    """
+    persisted = effective or "NA"
+    _set_pe_cfg_value(model.cfg, "diar_normalize_type", persisted)
+    hparams = getattr(model, "hparams", None)
+    saved_cfg = hparams.get("cfg", None) if isinstance(hparams, Mapping) else None
+    saved_pe_cfg = saved_cfg.get("parallel_expert_encoder", None) if isinstance(saved_cfg, Mapping) else None
+    if isinstance(saved_pe_cfg, Mapping) and saved_pe_cfg.get("diar_normalize_type", None) != persisted:
+        saved_cfg = copy.deepcopy(saved_cfg)
+        _set_pe_cfg_value(saved_cfg, "diar_normalize_type", persisted)
+        hparams["cfg"] = saved_cfg
+    logging.info(
+        "Persisted parallel_expert_encoder.diar_normalize_type=%r, the value the encoder runs with.", persisted
+    )
+
+
 def _pe_normalize_is_auto(cfg) -> bool:
     pe_cfg = cfg.get("parallel_expert_encoder", None) if isinstance(cfg, Mapping) else None
     return isinstance(pe_cfg, Mapping) and _is_auto_normalize(pe_cfg.get("asr_normalize_type", None))
@@ -812,14 +840,18 @@ def _pe_normalize_is_auto(cfg) -> bool:
 
 def _set_auto_normalize(cfg, value) -> None:
     """Set ``cfg.parallel_expert_encoder.asr_normalize_type`` to ``value`` if it is ``auto``."""
-    if not _pe_normalize_is_auto(cfg):
-        return
+    if _pe_normalize_is_auto(cfg):
+        _set_pe_cfg_value(cfg, "asr_normalize_type", value)
+
+
+def _set_pe_cfg_value(cfg, key: str, value) -> None:
+    """Set ``cfg.parallel_expert_encoder[key]`` to ``value``, also in a struct ``DictConfig``."""
     pe_cfg = cfg["parallel_expert_encoder"]
     if isinstance(pe_cfg, DictConfig):
         with open_dict(pe_cfg):
-            pe_cfg.asr_normalize_type = value
+            pe_cfg[key] = value
     else:
-        pe_cfg["asr_normalize_type"] = value
+        pe_cfg[key] = value
 
 
 def _remap_asr_state_dict(asr_state: Dict[str, torch.Tensor], perception) -> Dict[str, torch.Tensor]:

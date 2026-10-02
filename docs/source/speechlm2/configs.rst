@@ -482,8 +482,10 @@ StreamingSTT models decode chunk by chunk, so they mount a ``StreamingParallelEx
 both routes: a bundle always mounts as the streaming class, whatever ``target`` its
 ``model_config.yaml`` names, and the two-checkpoint route does so unless
 ``model.parallel_expert_encoder.streaming`` is ``false``. A bundle's weights and offline outputs are
-the same for both classes; the streaming class only adds the cache-aware streaming interface.
-SALM's bundle mount is unchanged (a local ``.nemo`` mounts as the plain ``ParallelExpertEncoder``).
+the same for both classes; the streaming class adds the cache-aware streaming interface, whose step
+applies the diarizer input's normalization to each chunk on its own (see ``diar_normalize_type``
+below). SALM's bundle mount is unchanged (a local ``.nemo`` mounts as the plain
+``ParallelExpertEncoder``).
 
 The ASR branch receives un-normalized mels and replays ``asr_normalize_type`` itself. On the
 two-checkpoint route, ``model.parallel_expert_encoder.asr_normalize_type`` takes these values:
@@ -501,6 +503,31 @@ two-checkpoint route, ``model.parallel_expert_encoder.asr_normalize_type`` takes
 
 ``auto`` needs the ASR checkpoint's preprocessor config, so a bundle (``model.pe_encoder_overrides``)
 rejects it.
+
+The diarizer branch also receives un-normalized mels, which bypass the diarizer's own preprocessor.
+``diar_normalize_type`` sets the normalization applied to them, the same way on both encoder classes
+and both routes (the bundle config, ``model.pe_encoder_overrides``, or
+``model.parallel_expert_encoder``):
+
+- absent: the diarizer's own ``preprocessor.normalize``, the normalization it was trained with (its
+  preprocessor's default if its config states none). The encoder logs what it resolved. A value
+  other than ``NA``, ``null``, ``per_feature`` or ``all_features`` is an error: set
+  ``diar_normalize_type`` for such a diarizer;
+- ``null`` or ``NA``: no normalization;
+- ``per_feature`` or ``all_features``: that normalization, whatever the diarizer's own is.
+
+Any other value is an error. The offline (training) forward and online inference normalize each
+whole utterance. The streaming step of a ``StreamingParallelExpertEncoder`` normalizes each chunk on
+its own, as it does the ASR input with ``asr_normalize_type``, so a stream feeds the diarizer
+differently normalized mels than training did. The first time the streaming class normalizes the
+diarizer input, it logs a warning saying so.
+
+The effective value is written to the bundle config that an HF export embeds, as ``null`` for none.
+A bundle saved with ``ParallelExpertEncoderPT.save_to_nemo`` and, on the two-checkpoint route,
+``model.parallel_expert_encoder`` in the model config and in the saved hyperparameters record it as
+``NA`` for none. ``null`` and ``NA`` both reload as no normalization, so a reload normalizes the
+diarizer input the same way, also into the other encoder class or after the diarizer checkpoint
+changed.
 
 The keys accepted in ``model.pe_encoder_overrides``:
 
@@ -524,8 +551,9 @@ The keys accepted in ``model.pe_encoder_overrides``:
        ``model.parallel_expert_encoder.sync_max_audio_length`` does the same on the two-checkpoint
        route.
    * - ``diar_normalize_type``
-     - Accepted only as ``null`` or ``NA``, which is what the encoder does: the diarizer always
-       receives un-normalized mels. Any other value is rejected.
+     - Normalization applied to the diarizer input (``per_feature``, ``all_features``, or
+       ``null``/``NA`` for none), on both encoder classes. Unset keeps the diarizer's own
+       ``preprocessor.normalize`` (see above).
    * - ``chunk_size_seconds``, ``frame_shift_seconds``
      - Rejected with an error naming the key, because nothing in this encoder reads them. Use
        ``model.encoder_chunk_size_seconds`` to chunk long audio.

@@ -13,8 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import io
+import json
 import tarfile
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 import pytest
@@ -33,6 +37,7 @@ from nemo.collections.asr.modules.parallel_expert_encoder import (
     _disable_dist_feature_sync,
 )
 from nemo.collections.asr.modules.transformer_encoder import StreamingTransformerEncoder
+from nemo.collections.asr.parts.preprocessing.features import normalize_batch
 
 # ``@experimental`` wraps the class in a wrapt proxy, so ``__new__`` (used to build
 # bare instances that skip the heavy real ``__init__``) must target the underlying
@@ -456,6 +461,17 @@ def toy_diarization_model_cfg() -> DictConfig:
     )
 
 
+def diarizer_cfg_with_normalize(normalize=_UNSET_SENTINEL) -> DictConfig:
+    """:func:`toy_diarization_model_cfg` trained with ``preprocessor.normalize: normalize`` (key left out for
+    ``_UNSET_SENTINEL``)."""
+    cfg = toy_diarization_model_cfg()
+    if normalize is _UNSET_SENTINEL:
+        del cfg.preprocessor['normalize']
+    else:
+        cfg.preprocessor.normalize = normalize
+    return cfg
+
+
 def build_toy_pe_encoder(**overrides) -> ParallelExpertEncoder:
     """Construct a real ParallelExpertEncoder from the tiny ASR + diar configs."""
     kwargs = dict(
@@ -784,11 +800,12 @@ def test_disabled_normalization_feeds_asr_branch_untouched(normalize_type, shoul
     assert torch.equal(fused, standalone) is should_match
 
 
-def write_toy_branch_checkpoints(tmp_path, asr_normalize=_UNSET_SENTINEL) -> tuple:
+def write_toy_branch_checkpoints(tmp_path, asr_normalize=_UNSET_SENTINEL, diar_normalize='per_feature') -> tuple:
     """Write a standalone ASR ``.nemo`` and a Sortformer ``.nemo`` for ``from_checkpoints``.
 
     The ASR config carries ``preprocessor.normalize: asr_normalize`` (the key is left out for
-    ``_UNSET_SENTINEL``); the weights come from one toy PE, so both files load strictly.
+    ``_UNSET_SENTINEL``), the diarizer config ``preprocessor.normalize: diar_normalize``; the weights
+    come from one toy PE, so both files load strictly.
     """
     source = build_toy_pe_encoder()
     preprocessor = {
@@ -800,6 +817,7 @@ def write_toy_branch_checkpoints(tmp_path, asr_normalize=_UNSET_SENTINEL) -> tup
     asr_cfg = {'preprocessor': preprocessor, 'encoder': OmegaConf.to_container(toy_asr_encoder_cfg())}
     asr_state = {f'encoder.{key}': value for key, value in source.asr_encoder.state_dict().items()}
     diar_cfg = OmegaConf.to_container(toy_diarization_model_cfg())
+    diar_cfg['preprocessor']['normalize'] = diar_normalize
     return (
         _write_nemo(tmp_path / 'asr.nemo', asr_cfg, asr_state),
         _write_nemo(tmp_path / 'diar.nemo', diar_cfg, source.diarization_model.state_dict()),
@@ -1125,9 +1143,11 @@ def sortformer_offline_predictions(enc, mels, length, monkeypatch):
     """What ``SortformerEncLabelModel.forward`` returns for these mels on the PE's fusion grid.
 
     ``forward`` starts from raw audio; its feature extraction is bypassed so that the reference
-    sees exactly the mels the PE hands its diarizer.
+    sees exactly the mels the PE hands its diarizer: these, normalised as ``diar_normalize_type`` says.
     """
     diar = enc.diarization_model
+    if enc.diar_normalize_type:
+        mels = normalize_batch(mels, length, normalize_type=enc.diar_normalize_type)[0]
     monkeypatch.setattr(diar, "process_signal", lambda audio_signal, audio_signal_length: (mels, length))
     return diar.forward(audio_signal=torch.zeros(mels.shape[0], 1), audio_signal_length=length)
 
@@ -1205,8 +1225,10 @@ def test_low_resolution_diarizer_offline_path_unchanged():
     targets = torch.stack([torch.full((n_frames, _N_SPK), -1.0), real])
 
     with torch.no_grad():
+        # The PE replays the toy diarizer's own `normalize: per_feature` on the diarizer input.
+        diar_mels = normalize_batch(mels, length, normalize_type='per_feature')[0]
         emb_seq, emb_seq_length = enc.diarization_model.frontend_encoder(
-            processed_signal=mels, processed_signal_length=length, bypass_pre_encode=False
+            processed_signal=diar_mels, processed_signal_length=length, bypass_pre_encode=False
         )
         raw = enc.diarization_model.forward_infer(emb_seq=emb_seq, emb_seq_length=emb_seq_length)
         enc(audio_signal=mels, length=length)
@@ -1369,14 +1391,20 @@ def test_bundle_without_overrides_keeps_each_branch_sync_flag(tmp_path):
     assert enc.missing_rttm_target == -1.0
 
 
+def _diar_normalization_is_off(enc):
+    # The toy diarizer was trained with `per_feature`, which the override replaces.
+    assert enc.diar_normalize_type is None
+
+
 @pytest.mark.unit
 @pytest.mark.parametrize(
     "overrides, check",
     [
         ({'sync_max_audio_length': False}, _sync_flag_is_applied),
         ({'missing_rttm_target': -2.0}, _missing_rttm_target_is_applied),
+        ({'diar_normalize_type': 'NA'}, _diar_normalization_is_off),
     ],
-    ids=["sync_max_audio_length", "missing_rttm_target"],
+    ids=["sync_max_audio_length", "missing_rttm_target", "diar_normalize_type"],
 )
 def test_bundle_overrides_are_applied(tmp_path, monkeypatch, overrides, check):
     """Allow-listed overrides with a consumer reach the encoder, and each is logged."""
@@ -1394,8 +1422,8 @@ def test_bundle_overrides_are_applied(tmp_path, monkeypatch, overrides, check):
 @pytest.mark.unit
 @pytest.mark.parametrize(
     "key, value",
-    [('diar_normalize_type', 'per_feature'), ('frame_shift_seconds', 0.02), ('chunk_size_seconds', 1.12)],
-    ids=["diar_normalize_type", "frame_shift_seconds", "chunk_size_seconds"],
+    [('frame_shift_seconds', 0.02), ('chunk_size_seconds', 1.12)],
+    ids=["frame_shift_seconds", "chunk_size_seconds"],
 )
 def test_consumerless_bundle_overrides_are_explicit(tmp_path, key, value):
     """Nothing in this encoder reads these keys, so an override that would change behaviour is
@@ -1406,14 +1434,26 @@ def test_consumerless_bundle_overrides_are_explicit(tmp_path, key, value):
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("value", [None, 'NA'])
-def test_diar_normalize_type_that_matches_the_encoder_is_accepted(tmp_path, value):
-    """Pin: the diarizer always receives un-normalised mels, so these values state what already
-    happens and keep loading (e.g. recipes that set ``diar_normalize_type: NA``)."""
+@pytest.mark.parametrize(
+    "diarizer_normalize, value, expected",
+    [
+        ('per_feature', None, None),
+        ('per_feature', 'NA', None),
+        ('NA', 'per_feature', 'per_feature'),
+        ('NA', 'all_features', 'all_features'),
+    ],
+    ids=["null_over_per_feature", "NA_over_per_feature", "per_feature_over_NA", "all_features_over_NA"],
+)
+def test_diar_normalize_type_override_wins_over_the_diarizer(tmp_path, diarizer_normalize, value, expected):
+    """A bundle override sets the diarizer input's normalization either way, whatever the diarizer's own
+    ``preprocessor.normalize`` says, and the bundle config the encoder records states the result."""
+    diar_cfg = diarizer_cfg_with_normalize(diarizer_normalize)
     enc = ParallelExpertEncoderPT.load_from_nemo(
-        write_toy_bundle(tmp_path / 'pe.nemo'), config_overrides={'diar_normalize_type': value}
+        write_toy_bundle(tmp_path / 'pe.nemo', diarization_model_cfg=diar_cfg),
+        config_overrides={'diar_normalize_type': value},
     )
-    assert branch_sync_flags(enc) == (True, True)
+    assert enc.diar_normalize_type == expected
+    assert enc._bundle_config.diar_normalize_type == (expected or 'NA')
 
 
 @pytest.mark.unit
@@ -1437,3 +1477,244 @@ def test_unset_sync_max_audio_length_keeps_each_branch_value():
     assert branch_sync_flags(enc) == (True, False)
     # The encoder-level flag reports whether ANY branch still all-reduces.
     assert enc.sync_max_audio_length is True
+
+
+# ----------------------------------------------------------------------------- #
+# Diarizer input normalization (`diar_normalize_type`)
+# ----------------------------------------------------------------------------- #
+def capture_diarizer_inputs(enc) -> list:
+    """Record the mels the diarizer receives, as ``(B, feat_in, T)``, on every path that feeds it.
+
+    The offline path passes them to ``frontend_encoder``. The windowed and streaming paths pass
+    time-major chunks to ``forward_streaming_step``, whose own ``frontend_encoder`` call carries
+    pre-encoded embeddings and is not recorded.
+    """
+    seen = []
+    frontend_encoder = enc.diarization_model.frontend_encoder
+    forward_streaming_step = enc.diarization_model.forward_streaming_step
+
+    def spy_frontend_encoder(**kwargs):
+        if not kwargs.get('bypass_pre_encode', False):
+            seen.append(kwargs['processed_signal'].detach().clone())
+        return frontend_encoder(**kwargs)
+
+    def spy_forward_streaming_step(**kwargs):
+        seen.append(kwargs['processed_signal'].detach().transpose(1, 2).clone())
+        return forward_streaming_step(**kwargs)
+
+    enc.diarization_model.frontend_encoder = spy_frontend_encoder
+    enc.diarization_model.forward_streaming_step = spy_forward_streaming_step
+    return seen
+
+
+# Online windows of 10 output frames and diarizer streaming knobs that suit them, so the windowed path
+# steps the diarizer several times on a short input.
+WINDOWED_PE_KWARGS = dict(
+    online_inference_length=10,
+    chunk_left_context=2,
+    chunk_right_context=2,
+    diar_fifo_len=10,
+    diar_spkcache_update_period=20,
+    diar_spkcache_len=20,
+)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("path", ["offline", "online_inference"])
+@pytest.mark.parametrize(
+    "diarizer_normalize, passed, expected",
+    [
+        ('per_feature', _UNSET_SENTINEL, 'per_feature'),
+        ('all_features', _UNSET_SENTINEL, 'all_features'),
+        ('NA', _UNSET_SENTINEL, None),
+        ('per_feature', 'NA', None),
+        ('NA', 'per_feature', 'per_feature'),
+        ('NA', 'all_features', 'all_features'),
+    ],
+    ids=[
+        "unset_follows_per_feature",
+        "unset_follows_all_features",
+        "unset_follows_NA",
+        "NA_wins",
+        "per_feature_wins",
+        "all_features_wins",
+    ],
+)
+def test_diarizer_receives_mels_normalized_as_resolved(path, diarizer_normalize, passed, expected):
+    """The PE bypasses the diarizer's own preprocessor. Unset, it replays that preprocessor's
+    normalization; an explicit ``diar_normalize_type`` wins either way. Both paths that feed the
+    diarizer normalise each row over the whole utterance, as the preprocessor did in training."""
+    overrides = {} if passed is _UNSET_SENTINEL else {'diar_normalize_type': passed}
+    enc = build_toy_pe_encoder(
+        diarization_model_cfg=diarizer_cfg_with_normalize(diarizer_normalize), **WINDOWED_PE_KWARGS, **overrides
+    ).eval()
+    enc._suppress_online_pbar = True
+    seen = capture_diarizer_inputs(enc)
+    generator = torch.Generator().manual_seed(0)
+    mels = 4.0 * torch.randn(2, _MEL_FEATURES, 160, generator=generator) + 17.0
+    lengths = torch.tensor([160, 113])
+
+    with torch.no_grad(), enc.online_inference(path == "online_inference"):
+        enc(mels, lengths)
+
+    want = normalize_batch(mels, lengths, normalize_type=expected)[0] if expected else mels
+    assert seen, "the diarizer was not run"
+    torch.testing.assert_close(seen[0], want[:, :, : seen[0].shape[-1]])
+    assert enc.diar_normalize_type == expected
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "diarizer_normalize, passed, expected",
+    [
+        ('all_features', _UNSET_SENTINEL, 'all_features'),
+        (None, _UNSET_SENTINEL, None),
+        (_UNSET_SENTINEL, _UNSET_SENTINEL, 'per_feature'),
+        ('per_feature', None, None),
+        ('per_feature', 'all_features', 'all_features'),
+    ],
+    ids=[
+        "unset_follows_all_features",
+        "unset_follows_null",
+        "unset_follows_the_default",
+        "null_wins",
+        "all_features_wins",
+    ],
+)
+def test_diar_normalize_type_resolution(diarizer_normalize, passed, expected):
+    """A diarizer config without ``preprocessor.normalize`` was trained with its preprocessor's default,
+    ``per_feature`` for the mel spectrogram, so that is what an unset value follows."""
+    overrides = {} if passed is _UNSET_SENTINEL else {'diar_normalize_type': passed}
+    enc = build_toy_pe_encoder(diarization_model_cfg=diarizer_cfg_with_normalize(diarizer_normalize), **overrides)
+    assert enc.diar_normalize_type == expected
+
+
+@pytest.mark.unit
+def test_unknown_diar_normalization_fails_closed():
+    """``normalize_batch`` returns the input of a type it does not know unchanged, so a typo would feed the
+    diarizer mels it was not trained on without a word. Neither an explicit value nor the diarizer's own
+    may be one; an explicit value does not consult the diarizer's own."""
+    with pytest.raises(ValueError, match=r"diar_normalize_type='per_featur' is not a normalization"):
+        build_toy_pe_encoder(diar_normalize_type='per_featur')
+    with pytest.raises(ValueError, match=r"preprocessor.normalize='fancy' .*set diar_normalize_type explicitly"):
+        build_toy_pe_encoder(diarization_model_cfg=diarizer_cfg_with_normalize('fancy'))
+    enc = build_toy_pe_encoder(diarization_model_cfg=diarizer_cfg_with_normalize('fancy'), diar_normalize_type='NA')
+    assert enc.diar_normalize_type is None
+
+
+def _capture_pe_infos(monkeypatch) -> list:
+    import nemo.collections.asr.modules.parallel_expert_encoder as pe_module
+
+    infos = []
+    monkeypatch.setattr(pe_module.logging, 'info', lambda msg, *args, **kwargs: infos.append(msg % args))
+    return infos
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "passed, fragments",
+    [
+        (_UNSET_SENTINEL, ["normalized with 'per_feature'", "own preprocessor.normalize='per_feature'"]),
+        ('NA', ["not normalized", "diar_normalize_type='NA'", "own preprocessor.normalize='per_feature'"]),
+    ],
+    ids=["unset", "explicit"],
+)
+def test_diar_normalization_is_logged_once_with_its_source(monkeypatch, passed, fragments):
+    """What the diarizer input gets, and where that came from, is logged once: at construction, not per forward."""
+    infos = _capture_pe_infos(monkeypatch)
+    overrides = {} if passed is _UNSET_SENTINEL else {'diar_normalize_type': passed}
+    enc = build_toy_pe_encoder(**overrides).eval()
+    with torch.no_grad():
+        enc(torch.randn(1, _MEL_FEATURES, 64), torch.tensor([64]))
+
+    lines = [line for line in infos if 'diarizer branch input' in line]
+    assert len(lines) == 1, lines
+    assert all(fragment in lines[0] for fragment in fragments), lines[0]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "diarizer_normalize, kwargs, expected",
+    [
+        ('per_feature', {}, 'per_feature'),
+        ('NA', {}, None),
+        ('per_feature', {'diar_normalize_type': 'NA'}, None),
+        ('NA', {'diar_normalize_type': 'per_feature'}, 'per_feature'),
+    ],
+    ids=["unset_follows_per_feature", "unset_follows_NA", "NA_wins", "per_feature_wins"],
+)
+def test_two_checkpoint_route_resolves_diar_normalization(tmp_path, diarizer_normalize, kwargs, expected):
+    """``from_checkpoints`` follows the diarizer checkpoint's own ``preprocessor.normalize`` unless told otherwise."""
+    asr, diar = write_toy_branch_checkpoints(tmp_path, diar_normalize=diarizer_normalize)
+    enc = ParallelExpertEncoder.from_checkpoints(asr, diar, asr_normalize_type=None, **kwargs)
+    assert enc.diar_normalize_type == expected
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "bundle_overrides, expected",
+    [
+        ({}, 'per_feature'),
+        ({'diar_normalize_type': 'NA'}, None),
+        ({'diar_normalize_type': None}, None),
+        ({'diar_normalize_type': 'all_features'}, 'all_features'),
+    ],
+    ids=["unset", "NA", "null", "all_features"],
+)
+def test_inline_config_resolves_and_records_diar_normalization(bundle_overrides, expected):
+    """An embedded bundle config (an HF export's ``pe_encoder_config``) resolves like a bundle file; an exported
+    null is an explicit "none". The bundle config the encoder keeps states the result, ``'NA'`` for none."""
+    enc = ParallelExpertEncoderPT.from_inline_config(toy_bundle_config(**bundle_overrides))
+    assert enc.diar_normalize_type == expected
+    assert enc._bundle_config.diar_normalize_type == (expected or 'NA')
+
+
+def hf_exported_pe_config(encoder) -> dict:
+    """The ``pe_encoder_config`` that ``examples/speechlm2/to_hf.py`` exports for ``encoder``, through JSON."""
+    spec = importlib.util.spec_from_file_location(
+        "to_hf_for_pe_tests", Path(__file__).parents[3] / "examples" / "speechlm2" / "to_hf.py"
+    )
+    to_hf = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(to_hf)
+    model = SimpleNamespace(cfg={"pe_encoder_path": "/models/pe.nemo"}, perception=SimpleNamespace(encoder=encoder))
+    return json.loads(json.dumps(to_hf._hf_export_config(model, "float32")["pe_encoder_config"]))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "diarizer_normalize, diar_normalize_type, template_states, expected",
+    [
+        ('per_feature', 'NA', _UNSET_SENTINEL, None),
+        ('NA', 'all_features', _UNSET_SENTINEL, 'all_features'),
+        ('NA', 'all_features', 'per_feature', 'all_features'),
+        ('per_feature', 'NA', 'all_features', None),
+        ('unsupported', 'NA', _UNSET_SENTINEL, None),
+    ],
+    ids=[
+        "NA_over_per_feature",
+        "all_features_over_NA",
+        "template_states_per_feature",
+        "template_states_all_features",
+        "template_unresolvable_alone",
+    ],
+)
+def test_export_and_save_round_trips_keep_the_diar_normalization(
+    tmp_path, diarizer_normalize, diar_normalize_type, template_states, expected
+):
+    """An HF export and a ``save_to_nemo`` bundle reload with the normalization the encoder ran with, here one
+    that is not the diarizer's own, which a reload falls back to when the value is not stated. ``save_to_nemo``
+    writes the encoder's value over whatever the template states, before it builds anything from the template:
+    unset over a diarizer ``normalize`` that the encoder had to override, the template alone would not resolve."""
+    diar_cfg = diarizer_cfg_with_normalize(diarizer_normalize)
+    source = build_toy_pe_encoder(diarization_model_cfg=diar_cfg, diar_normalize_type=diar_normalize_type)
+    stated = {} if template_states is _UNSET_SENTINEL else {'diar_normalize_type': template_states}
+
+    template = write_toy_bundle(tmp_path / 'template.nemo', diarization_model_cfg=diar_cfg, **stated)
+    ParallelExpertEncoderPT.save_to_nemo(source, str(tmp_path / 'saved.nemo'), template_bundle_path=template)
+    saved = ParallelExpertEncoderPT.load_from_nemo(str(tmp_path / 'saved.nemo'), strict=True)
+    assert saved.diar_normalize_type == expected
+    assert all(torch.equal(saved.state_dict()[key], value) for key, value in source.state_dict().items())
+
+    exported = hf_exported_pe_config(saved)
+    assert exported['diar_normalize_type'] == expected
+    assert ParallelExpertEncoderPT.from_inline_config(exported).diar_normalize_type == expected

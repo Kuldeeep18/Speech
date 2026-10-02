@@ -29,12 +29,23 @@ from nemo.collections.asr.modules.parallel_expert_encoder import (
     StreamingParallelExpertEncoderPT,
 )
 from nemo.collections.asr.parts.mixins.streaming import StreamingEncoder
+from nemo.collections.asr.parts.preprocessing.features import normalize_batch
 from tests.collections.asr.test_parallel_expert_encoder import (
     _MEL_FEATURES,
     _N_SPK,
     _SUBSAMPLING_FACTOR,
+    _UNSET_SENTINEL,
+    WINDOWED_PE_KWARGS,
+    _capture_pe_warnings,
+    build_toy_pe_encoder,
+    capture_diarizer_inputs,
+    diarizer_cfg_with_normalize,
+    hf_exported_pe_config,
     toy_asr_encoder_cfg,
+    toy_bundle_config,
     toy_diarization_model_cfg,
+    write_toy_branch_checkpoints,
+    write_toy_bundle,
 )
 
 
@@ -184,10 +195,9 @@ def test_streaming_bundle_shell_restores_the_same_weights_and_offline_outputs(tm
     """Compatibility pin for mounting bundles as the streaming class (StreamingSTT, P-2).
 
     The same ``.nemo`` strict-loads through both shells with an identical state dict, and the offline
-    forward is the same, so the class change only adds the streaming interface.
+    forward is the same, so the class change only adds the streaming interface. Both classes replay the
+    toy diarizer's own ``per_feature`` on its input, over the whole utterance.
     """
-    from tests.collections.asr.test_parallel_expert_encoder import write_toy_bundle
-
     torch.manual_seed(0)
     bundle = write_toy_bundle(
         tmp_path / 'pe.nemo',
@@ -585,3 +595,271 @@ def test_a_sentinel_row_after_skipped_chunks_fails_closed():
     diarizer = _stream(enc, mel)
     mixed = _stream(enc, mel, targets, sentinel_rows=(1,))
     assert all(torch.equal(m[1], d[1]) for m, d in zip(mixed, diarizer))
+
+
+# ==============================================================================================
+# The diarizer input's normalization (`diar_normalize_type`): as the base class, per chunk in a stream
+# ==============================================================================================
+def _chunk_size(enc) -> int:
+    chunk_size = enc.streaming_cfg.chunk_size
+    return chunk_size[1] if isinstance(chunk_size, (list, tuple)) else chunk_size
+
+
+def _shift_size(enc) -> int:
+    shift = enc.streaming_cfg.shift_size
+    return shift[1] if isinstance(shift, (list, tuple)) else shift
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("path", ["offline", "online_inference", "stream_step"])
+@pytest.mark.parametrize(
+    "diarizer_normalize, passed, expected",
+    [
+        ("per_feature", _UNSET_SENTINEL, "per_feature"),
+        ("all_features", _UNSET_SENTINEL, "all_features"),
+        ("NA", _UNSET_SENTINEL, None),
+        ("per_feature", "NA", None),
+        ("NA", "per_feature", "per_feature"),
+        ("NA", "all_features", "all_features"),
+    ],
+    ids=[
+        "unset_follows_per_feature",
+        "unset_follows_all_features",
+        "unset_follows_NA",
+        "NA_wins",
+        "per_feature_wins",
+        "all_features_wins",
+    ],
+)
+def test_streaming_encoder_normalizes_the_diarizer_input_as_resolved(path, diarizer_normalize, passed, expected):
+    """The streaming encoder resolves ``diar_normalize_type`` as the base class does: unset follows the diarizer's
+    own normalization, and an explicit value wins either way. Its offline (training) forward and windowed online
+    inference normalise the whole utterance, as the base class does; its streaming step normalises each chunk on
+    its own, as it does the ASR input. The diarizer's streaming knobs are set explicitly, so their overrides apply."""
+    overrides = {} if passed is _UNSET_SENTINEL else {"diar_normalize_type": passed}
+    enc = build_toy_streaming_pe_encoder(
+        diarization_model_cfg=diarizer_cfg_with_normalize(diarizer_normalize), **WINDOWED_PE_KWARGS, **overrides
+    ).eval()
+    enc._suppress_online_pbar = True
+    enc.setup_streaming_params()
+    seen = capture_diarizer_inputs(enc)
+    generator = torch.Generator().manual_seed(0)
+
+    if path == "stream_step":
+        mels = 4.0 * torch.randn(2, _MEL_FEATURES, 512, generator=generator) + 17.0
+        _stream(enc, mels)
+        chunk_size, shift = _chunk_size(enc), _shift_size(enc)
+        lengths = torch.tensor([chunk_size] * mels.shape[0])
+        # Each chunk with its own statistics: a stream has no others.
+        given = [(mels[:, :, step * shift : step * shift + chunk_size], lengths) for step in range(_N_CHUNKS)]
+    else:
+        mels = 4.0 * torch.randn(2, _MEL_FEATURES, 160, generator=generator) + 17.0
+        lengths = torch.tensor([160, 113])
+        with torch.no_grad(), enc.online_inference(path == "online_inference"):
+            enc(mels, lengths)
+        # The whole utterance, whose first frames are the diarizer's first input on both paths.
+        given = [(mels, lengths)]
+
+    assert len(seen) >= len(given), f"the diarizer was run {len(seen)} times"
+    for got, (signal, length) in zip(seen, given):
+        want = normalize_batch(signal, length, normalize_type=expected)[0] if expected else signal
+        torch.testing.assert_close(got, want[:, :, : got.shape[-1]])
+    assert enc.diar_normalize_type == expected
+
+
+def _streaming_encoder_via(route, tmp_path, diar_normalize_type=_UNSET_SENTINEL, diarizer_normalize="per_feature"):
+    """Build a StreamingParallelExpertEncoder on ``route`` over a toy diarizer trained with ``diarizer_normalize``,
+    with ``diar_normalize_type`` unless it is unset."""
+    stated = {} if diar_normalize_type is _UNSET_SENTINEL else {"diar_normalize_type": diar_normalize_type}
+    diar_cfg = diarizer_cfg_with_normalize(diarizer_normalize)
+    if route == "constructor":
+        return build_toy_streaming_pe_encoder(diarization_model_cfg=diar_cfg, **stated)
+    if route == "inline_config":
+        config = toy_bundle_config(
+            asr_encoder_cfg=streaming_asr_encoder_cfg(),
+            asr_normalize_type=None,
+            diarization_model_cfg=diar_cfg,
+            **stated,
+        )
+        return StreamingParallelExpertEncoderPT.from_inline_config(config)
+    if route == "config_overrides":
+        bundle = write_toy_bundle(
+            tmp_path / "pe.nemo",
+            encoder=build_toy_streaming_pe_encoder(),
+            asr_encoder_cfg=streaming_asr_encoder_cfg(),
+            asr_normalize_type=None,
+            diarization_model_cfg=diar_cfg,
+        )
+        return StreamingParallelExpertEncoderPT.load_from_nemo(bundle, config_overrides=stated)
+    asr, diar = write_toy_branch_checkpoints(tmp_path, diar_normalize=diarizer_normalize)
+    return StreamingParallelExpertEncoder.from_checkpoints(asr, diar, asr_normalize_type=None, **stated)
+
+
+_STREAMING_ROUTES = ["constructor", "inline_config", "config_overrides", "from_checkpoints"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("route", _STREAMING_ROUTES)
+@pytest.mark.parametrize(
+    "diarizer_normalize, value, expected",
+    [
+        ("per_feature", _UNSET_SENTINEL, "per_feature"),
+        ("NA", _UNSET_SENTINEL, None),
+        ("per_feature", None, None),
+        ("per_feature", "NA", None),
+        ("NA", "per_feature", "per_feature"),
+        ("NA", "all_features", "all_features"),
+    ],
+    ids=[
+        "unset_follows_per_feature",
+        "unset_follows_NA",
+        "null_wins",
+        "NA_wins",
+        "per_feature_wins",
+        "all_features_wins",
+    ],
+)
+def test_streaming_routes_resolve_the_diarizer_normalization(tmp_path, route, diarizer_normalize, value, expected):
+    """Every route that builds the streaming class resolves ``diar_normalize_type`` as the base class does: unset
+    follows the diarizer's own normalization, and an explicit value overrides it either way, without an error. A
+    bundle shell records the result in the bundle config it keeps, ``'NA'`` for none."""
+    enc = _streaming_encoder_via(route, tmp_path, value, diarizer_normalize)
+    assert isinstance(enc, StreamingParallelExpertEncoder)
+    assert enc.diar_normalize_type == expected
+    if route in ("inline_config", "config_overrides"):
+        assert enc._bundle_config.diar_normalize_type == (expected or "NA")
+
+
+def _per_chunk_normalization_warnings(warnings) -> list:
+    return [line for line in warnings if "normalizes each chunk on its own" in line]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("first_path", ["offline", "online_inference", "stream_step"])
+@pytest.mark.parametrize(
+    "diarizer_normalize, passed, expected",
+    [
+        ("per_feature", _UNSET_SENTINEL, "per_feature"),
+        ("all_features", _UNSET_SENTINEL, "all_features"),
+        ("NA", _UNSET_SENTINEL, None),
+        ("per_feature", "NA", None),
+        ("NA", "per_feature", "per_feature"),
+    ],
+    ids=["unset_per_feature", "unset_all_features", "unset_NA", "explicit_NA", "explicit_per_feature"],
+)
+def test_streaming_encoder_warns_once_when_it_normalizes_the_diarizer_input(
+    monkeypatch, first_path, diarizer_normalize, passed, expected
+):
+    """The first time the streaming encoder normalises the diarizer input, on whichever path, it warns that its
+    streaming step normalises each chunk on its own while the offline (training) forward uses the whole utterance.
+    It warns once: later forwards, chunks and online windows add nothing. Without a normalization there is
+    nothing to warn about, and the plain encoder, which has no streaming step, never warns."""
+    warnings = _capture_pe_warnings(monkeypatch)
+    overrides = {} if passed is _UNSET_SENTINEL else {"diar_normalize_type": passed}
+    diar_cfg = diarizer_cfg_with_normalize(diarizer_normalize)
+    enc = build_toy_streaming_pe_encoder(diarization_model_cfg=diar_cfg, **WINDOWED_PE_KWARGS, **overrides).eval()
+    enc._suppress_online_pbar = True
+    enc.setup_streaming_params()
+    assert _per_chunk_normalization_warnings(warnings) == [], "warned before normalising anything"
+    mels = torch.randn(1, _MEL_FEATURES, 512, generator=torch.Generator().manual_seed(0))
+    lengths = torch.tensor([mels.shape[-1]])
+
+    with torch.no_grad():
+        if first_path == "stream_step":
+            _stream(enc, mels)
+        else:
+            with enc.online_inference(first_path == "online_inference"):
+                enc(mels, lengths)
+        lines = _per_chunk_normalization_warnings(warnings)
+        assert len(lines) == (1 if expected else 0), lines
+        assert all(repr(expected) in line for line in lines), lines
+
+        with enc.online_inference(False):
+            enc(mels, lengths)
+        _stream(enc, mels)
+        with enc.online_inference():
+            enc(mels, lengths)
+        assert _per_chunk_normalization_warnings(warnings) == lines, "warned again"
+
+        plain = build_toy_pe_encoder(diarization_model_cfg=diar_cfg, **WINDOWED_PE_KWARGS, **overrides).eval()
+        plain._suppress_online_pbar = True
+        with plain.online_inference(False):
+            plain(mels, lengths)
+        with plain.online_inference():
+            plain(mels, lengths)
+    assert _per_chunk_normalization_warnings(warnings) == lines, "the plain encoder warned"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "source_states, template_states, expected",
+    [(_UNSET_SENTINEL, "NA", "per_feature"), ("NA", "per_feature", None)],
+    ids=["unset_follows_per_feature", "NA_over_per_feature"],
+)
+def test_streaming_export_and_save_keep_the_diar_normalization(tmp_path, source_states, template_states, expected):
+    """The streaming encoder's effective ``diar_normalize_type`` is what its HF export and a bundle it saves state,
+    so a reload into either class (StreamingSTT, or vLLM and SALM, which mount the plain class) normalises the
+    diarizer input as the encoder did. ``save_to_nemo`` writes it over what the template states."""
+    stated = {} if source_states is _UNSET_SENTINEL else {"diar_normalize_type": source_states}
+    streaming = StreamingParallelExpertEncoderPT.from_inline_config(
+        toy_bundle_config(asr_encoder_cfg=streaming_asr_encoder_cfg(), asr_normalize_type=None, **stated)
+    )
+    assert streaming.diar_normalize_type == expected
+    exported = hf_exported_pe_config(streaming)
+    assert exported["diar_normalize_type"] == expected
+
+    template = write_toy_bundle(
+        tmp_path / "template.nemo",
+        encoder=build_toy_streaming_pe_encoder(),
+        asr_encoder_cfg=streaming_asr_encoder_cfg(),
+        asr_normalize_type=None,
+        diar_normalize_type=template_states,
+    )
+    saved = str(tmp_path / "saved.nemo")
+    StreamingParallelExpertEncoderPT.save_to_nemo(streaming, saved, template_bundle_path=template)
+    for loader in (ParallelExpertEncoderPT, StreamingParallelExpertEncoderPT):
+        assert loader.from_inline_config(exported).diar_normalize_type == expected
+        assert loader.load_from_nemo(saved).diar_normalize_type == expected
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("normalize", ["per_feature", "all_features"])
+def test_streaming_step_normalizes_the_diarizer_chunk_as_it_does_the_asr_chunk(normalize):
+    """The streaming step hands the diarizer the chunk normalised exactly as the ASR branch's: the same tensor,
+    with the same per-row valid lengths, so a padded row is normalised over its valid frames only."""
+    enc = build_toy_streaming_pe_encoder(asr_normalize_type=normalize, diar_normalize_type=normalize).eval()
+    enc.setup_streaming_params()
+    asr_inputs, diar_inputs = [], []
+    asr_step = enc.asr_encoder.cache_aware_stream_step
+    diar_step = enc.diarization_model.forward_streaming_step
+
+    def spy_asr_step(**kwargs):
+        asr_inputs.append(kwargs["processed_signal"].detach().clone())
+        return asr_step(**kwargs)
+
+    def spy_diar_step(**kwargs):
+        diar_inputs.append(kwargs["processed_signal"].detach().transpose(1, 2).clone())
+        return diar_step(**kwargs)
+
+    enc.asr_encoder.cache_aware_stream_step = spy_asr_step
+    enc.diarization_model.forward_streaming_step = spy_diar_step
+    chunk_size, shift = _chunk_size(enc), _shift_size(enc)
+    mels = 3.0 * torch.randn(2, _MEL_FEATURES, 512, generator=torch.Generator().manual_seed(0)) + 11.0
+    state = list(enc.get_initial_cache_state(batch_size=2))
+    with torch.no_grad():
+        for step in range(_N_CHUNKS):
+            chunk = mels[:, :, step * shift : step * shift + chunk_size]
+            # The second row's last chunk is padded, as at the end of a shorter stream.
+            lengths = torch.tensor([chunk_size, chunk_size - 5 if step == _N_CHUNKS - 1 else chunk_size])
+            out = enc.cache_aware_stream_step(
+                processed_signal=chunk,
+                processed_signal_length=lengths,
+                cache_last_channel=state[0],
+                cache_last_time=state[1],
+                cache_last_channel_len=state[2],
+                keep_all_outputs=False,
+                drop_extra_pre_encoded=0 if step == 0 else enc.streaming_cfg.drop_extra_pre_encoded,
+            )
+            state = list(out[2:])
+            torch.testing.assert_close(diar_inputs[-1], asr_inputs[-1], rtol=0, atol=0)
+            torch.testing.assert_close(diar_inputs[-1], normalize_batch(chunk, lengths, normalize_type=normalize)[0])

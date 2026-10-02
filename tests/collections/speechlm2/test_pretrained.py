@@ -999,3 +999,111 @@ def test_setup_speech_encoder_mounts_either_bundle_source(key):
         pretrained.setup_speech_encoder(model, pretrained_weights=False)
 
     mount.assert_called_once_with(model)
+
+
+# ---------------------------------------------------------------------------------------------
+# ParallelExpertEncoder mounts: the normalization of the diarizer input (`diar_normalize_type`)
+# ---------------------------------------------------------------------------------------------
+_UNSTATED = object()
+_PE_MOUNT_ROUTES = ["bundle", "hf_export", "two_checkpoint"]
+
+
+def _mount_toy_pe(route, tmp_path, monkeypatch, streaming, diar_normalize_type=_UNSTATED):
+    """Mount the toy PE, whose diarizer was trained with ``per_feature``, on ``route`` and return it.
+
+    ``diar_normalize_type`` is stated where the route takes it: ``pe_encoder_overrides`` for a bundle, the
+    exported ``pe_encoder_config`` for an HF export, ``model.parallel_expert_encoder`` for two checkpoints.
+    """
+    import nemo.collections.asr.modules.parallel_expert_encoder as pe_module
+    from tests.collections.asr.test_parallel_expert_encoder import write_toy_bundle
+
+    stated = {} if diar_normalize_type is _UNSTATED else {"diar_normalize_type": diar_normalize_type}
+    if route == "two_checkpoint":
+        sources = _toy_branch_sources("NA")
+        monkeypatch.setattr(pe_module, "_resolve_branch_source", lambda name, model_cls, map_location: sources[name])
+        pe_cfg = {"asr_model": "toy/asr", "diar_model": "toy/diar", "asr_normalize_type": None, "streaming": streaming}
+        model = _pe_mount_model({"parallel_expert_encoder": {**pe_cfg, **stated}, "perception": _perception_cfg(None)})
+        pretrained.setup_parallel_expert_encoder_from_checkpoints(model)
+        return model.perception.encoder
+
+    cfg = {"pe_encoder_path": write_toy_bundle(tmp_path / "pe.nemo"), "perception": {}}
+    if route == "bundle":
+        if stated:
+            cfg["pe_encoder_overrides"] = stated
+        model = _pe_mount_model(cfg)
+        pretrained.setup_parallel_expert_encoder(model, streaming=streaming)
+        return model.perception.encoder
+
+    source = _pe_mount_model(cfg)
+    pretrained.setup_parallel_expert_encoder(source, streaming=streaming)
+    exported = _hf_export_config(source)
+    exported["pe_encoder_config"].update(stated)
+    model = _pe_mount_model({**exported, "perception": {}})
+    pretrained.setup_parallel_expert_encoder(model, streaming=streaming)
+    return model.perception.encoder
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("route", _PE_MOUNT_ROUTES)
+@pytest.mark.parametrize("streaming", [False, True], ids=["plain", "streaming"])
+def test_pe_mounts_resolve_the_diarizer_normalization(tmp_path, monkeypatch, cpu_default_device, route, streaming):
+    """Unstated, the plain encoder (SALM, or ``streaming: false``) and the streaming encoder that StreamingSTT
+    mounts both replay the diarizer's own ``per_feature``: on every route, including the reload of an HF export."""
+    assert _mount_toy_pe(route, tmp_path, monkeypatch, streaming).diar_normalize_type == "per_feature"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("route", _PE_MOUNT_ROUTES)
+@pytest.mark.parametrize("streaming", [False, True], ids=["plain", "streaming"])
+@pytest.mark.parametrize(
+    "stated, expected", [("NA", None), ("all_features", "all_features")], ids=["NA", "all_features"]
+)
+def test_pe_mounts_apply_a_stated_diarizer_normalization(
+    tmp_path, monkeypatch, cpu_default_device, route, streaming, stated, expected
+):
+    """A stated value overrides the diarizer's own ``per_feature`` either way, on both classes and every route."""
+    assert _mount_toy_pe(route, tmp_path, monkeypatch, streaming, stated).diar_normalize_type == expected
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("streaming", [True, False], ids=["streaming", "plain"])
+@pytest.mark.parametrize(
+    "stated, persisted, effective",
+    [(_UNSTATED, "per_feature", "per_feature"), (None, "NA", None), ("all_features", "all_features", "all_features")],
+    ids=["unset_follows_the_diarizer", "null", "all_features"],
+)
+def test_two_checkpoint_mount_persists_the_effective_diar_normalization(
+    monkeypatch, cpu_default_device, streaming, stated, persisted, effective
+):
+    """Unset, ``diar_normalize_type`` follows the diarizer checkpoint, so the value the encoder runs with is written
+    to ``model.cfg`` (HF export) and to the saved hyperparameters (``.ckpt``), ``'NA'`` for none, as a resolved
+    ``asr_normalize_type: auto`` is, without editing the caller's config. A reload then keeps it after the
+    diarizer checkpoint changed, into either encoder class."""
+    import nemo.collections.asr.modules.parallel_expert_encoder as pe_module
+
+    sources = _toy_branch_sources("NA")  # The toy diarizer was trained with `per_feature`.
+    monkeypatch.setattr(pe_module, "_resolve_branch_source", lambda name, model_cls, map_location: sources[name])
+    pe_cfg = {"asr_model": "toy/asr", "diar_model": "toy/diar", "asr_normalize_type": None, "streaming": streaming}
+    if stated is not _UNSTATED:
+        pe_cfg["diar_normalize_type"] = stated
+    caller_cfg = {"parallel_expert_encoder": pe_cfg, "perception": _perception_cfg(None)}
+    unedited = copy.deepcopy(caller_cfg)
+    model = _pe_mount_model(copy.deepcopy(caller_cfg))
+    # Lightning's `save_hyperparameters()` keeps the caller's own `cfg` object.
+    model.hparams = {"cfg": caller_cfg}
+
+    pretrained.setup_parallel_expert_encoder_from_checkpoints(model)
+
+    assert model.cfg.parallel_expert_encoder.get("diar_normalize_type") == persisted
+    assert model.hparams["cfg"]["parallel_expert_encoder"].get("diar_normalize_type") == persisted
+    assert caller_cfg == unedited, "the caller's config was edited"
+    assert model.perception.encoder.diar_normalize_type == effective
+
+    # Reload from the saved hyperparameters after the diarizer checkpoint changed its normalization.
+    sources["toy/diar"][0]["preprocessor"]["normalize"] = "NA"
+    for reload_streaming in (streaming, not streaming):
+        saved = copy.deepcopy(model.hparams["cfg"])
+        saved["parallel_expert_encoder"]["streaming"] = reload_streaming
+        reloaded = _pe_mount_model(saved)
+        pretrained.setup_parallel_expert_encoder_from_checkpoints(reloaded)
+        assert reloaded.perception.encoder.diar_normalize_type == effective

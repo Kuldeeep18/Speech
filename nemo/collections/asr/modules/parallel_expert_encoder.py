@@ -17,9 +17,11 @@
 Runs a Sortformer speaker-diarization expert and an ASR Conformer encoder on the
 same mel input, then fuses their outputs (LayerNorm + sinusoidal speaker-kernel +
 ADD). Expects un-normalised mels; the ASR branch re-applies ``normalize_batch``
-internally. I/O matches :class:`ConformerEncoder` (drop-in). Only self-contained PE
-bundles (inline ``asr_encoder_cfg`` + ``diarization_model_cfg`` in
-``model_config.yaml``) are supported.
+internally, and so does the diarizer branch, as ``diar_normalize_type`` says (by
+default, as the diarizer's own preprocessor did). I/O matches
+:class:`ConformerEncoder` (drop-in). Only self-contained PE bundles (inline
+``asr_encoder_cfg`` + ``diarization_model_cfg`` in ``model_config.yaml``) are
+supported.
 """
 
 from __future__ import annotations
@@ -165,9 +167,12 @@ _UNCONSUMED_BUNDLE_OVERRIDE_KEYS = {
         "the ASR branch's subsampling factor"
     ),
 }
-# The diarizer branch always receives the un-normalised mels, so `diar_normalize_type` is accepted
-# only with a value that states exactly that.
-_DIAR_NORMALIZE_NOOP_VALUES = (None, "NA")
+# `diar_normalize_type`: how the diarizer branch normalises the un-normalised mels it receives. They bypass the
+# diarizer's own preprocessor, so unset, the encoder replays that preprocessor's `normalize` and keeps the input the
+# diarizer was trained on; an explicit value overrides it. The streaming encoder's step normalises each chunk on its
+# own, as it does the ASR input. `None` and 'NA' mean no normalisation; these are the normalisations the branch can
+# apply.
+_DIAR_NORMALIZE_TYPES = ("per_feature", "all_features")
 
 
 def _normalize_speaker_feature_contract(
@@ -248,19 +253,8 @@ def _merge_bundle_config_overrides(cfg: DictConfig, config_overrides: Optional[M
         raise ValueError(
             f"Unsupported ParallelExpertEncoder config_overrides keys {unknown}; supported keys: {supported}."
         )
-    diar_normalize_type = config_overrides.get("diar_normalize_type", None)
-    if diar_normalize_type not in _DIAR_NORMALIZE_NOOP_VALUES:
-        raise ValueError(
-            f"ParallelExpertEncoder config_overrides diar_normalize_type={diar_normalize_type!r} is not supported: "
-            "the diarizer branch always receives un-normalised mels, so only null or 'NA' can be honoured."
-        )
     for key in sorted(config_overrides):
-        logging.info(
-            "[ParallelExpertEncoder] Applying bundle config override %s=%r%s.",
-            key,
-            config_overrides[key],
-            " (no-op: the diarizer input is never normalised)" if key == "diar_normalize_type" else "",
-        )
+        logging.info("[ParallelExpertEncoder] Applying bundle config override %s=%r.", key, config_overrides[key])
     return OmegaConf.merge(merged, OmegaConf.create(dict(config_overrides)))
 
 
@@ -326,6 +320,7 @@ class ParallelExpertEncoderPT(ModelPT):
             asr_encoder_cfg=self._cfg.get('asr_encoder_cfg', None),
             diarization_model_cfg=self._cfg.get('diarization_model_cfg', None),
             asr_normalize_type=self._cfg.get('asr_normalize_type', _NORMALIZE_UNSET),
+            diar_normalize_type=self._cfg.get('diar_normalize_type', _NORMALIZE_UNSET),
             freeze_diar=self._cfg.get('freeze_diar', True),
             freeze_asr=self._cfg.get('freeze_asr', False),
             online_inference_length=self._cfg.get('online_inference_length', 500),
@@ -353,6 +348,7 @@ class ParallelExpertEncoderPT(ModelPT):
         self.encoder._bundle_config.speaker_feature_mode = self.encoder.speaker_feature_mode
         self.encoder._bundle_config.speaker_activity_threshold = self.encoder.speaker_activity_threshold
         self.encoder._bundle_config.chunk_size_seconds = self.encoder.chunk_size_seconds
+        self.encoder._bundle_config.diar_normalize_type = _persisted_diar_normalize_type(self.encoder)
 
     @staticmethod
     def _validate_bundle_schema(cfg: DictConfig) -> None:
@@ -432,8 +428,8 @@ class ParallelExpertEncoderPT(ModelPT):
                 can resolve a legacy bundle's speaker-feature ambiguity without silently swapping
                 the saved architecture. Local ``.nemo`` paths only. Each applied override is logged.
                 ``chunk_size_seconds`` and ``frame_shift_seconds`` are refused because nothing here
-                consumes them, and ``diar_normalize_type`` accepts only ``None``/``'NA'`` because the
-                diarizer input is never normalised.
+                consumes them. ``diar_normalize_type`` overrides the diarizer's own normalization on both
+                encoder classes, as the encoder argument of that name does.
 
         Returns:
             The restored :class:`ParallelExpertEncoder`.
@@ -520,7 +516,9 @@ class ParallelExpertEncoderPT(ModelPT):
         from ``template_bundle_path``.
 
         The template must describe the same architecture (``d_model``, ``n_spk``);
-        mismatches raise :class:`ValueError` fail-fast.
+        mismatches raise :class:`ValueError` fail-fast. The saved config is the template's, except
+        ``diar_normalize_type``, which is set to the encoder's effective value (``'NA'`` for none), so a
+        reload normalises the diarizer input as ``encoder`` does.
 
         Args:
             encoder (ParallelExpertEncoder): The encoder whose weights are persisted.
@@ -569,10 +567,14 @@ class ParallelExpertEncoderPT(ModelPT):
                 "saved bundle would fail strict reload."
             )
 
-        # Fresh PT shell from the template cfg to reuse NeMo's save_to; swap in encoder.
+        # The saved config is the template with one change: the encoder's effective `diar_normalize_type`, which the
+        # template need not state or may state otherwise. Set it first, so the shell below resolves the value being
+        # saved; the template's own may not resolve (unset, over a diarizer `normalize` the encoder had to override).
+        template_cfg.diar_normalize_type = _persisted_diar_normalize_type(encoder)
+        # Fresh PT shell from that cfg to reuse NeMo's save_to; swap in encoder.
         shell = cls(cfg=template_cfg, trainer=None)
         shell.encoder = encoder
-        # Pin `_cfg` to the verbatim template so save_to round-trips it exactly.
+        # Pin `_cfg` to that cfg so save_to round-trips it.
         shell._cfg = template_cfg
 
         shell.save_to(output_nemo_path)
@@ -597,6 +599,13 @@ class ParallelExpertEncoder(nn.Module):
             ``per_feature`` when unset; pass ``None`` or ``'NA'`` to disable it entirely (required
             for ASR branches whose own preprocessor already uses ``normalize: NA``). ``'auto'`` is
             resolved by :meth:`from_checkpoints` only and is rejected here.
+        diar_normalize_type (str, optional): Normalization applied to the diarizer branch's input.
+            Unset (default) keeps the diarizer's own: its config's ``preprocessor.normalize``, which
+            its preprocessor applied in training. ``'per_feature'`` or ``'all_features'`` overrides
+            it, ``None`` or ``'NA'`` disables it, and any other value raises. The same holds for
+            :class:`StreamingParallelExpertEncoder`. The offline forward and online inference normalise
+            each whole utterance; the streaming class's ``cache_aware_stream_step`` normalises each
+            chunk on its own, as it does the ASR input.
         freeze_diar (bool): Freeze the Sortformer parameters. Defaults to ``True``.
         freeze_asr (bool): Freeze the wrapped ASR ConformerEncoder. Defaults to ``False``.
         online_inference_length (int): Online-inference window in encoder output frames
@@ -626,6 +635,7 @@ class ParallelExpertEncoder(nn.Module):
         asr_encoder_cfg: DictConfig,
         diarization_model_cfg: DictConfig,
         asr_normalize_type: Optional[str] = _NORMALIZE_UNSET,
+        diar_normalize_type: Optional[str] = _NORMALIZE_UNSET,
         freeze_diar: bool = True,
         freeze_asr: bool = False,
         online_inference_length: int = 500,
@@ -681,6 +691,9 @@ class ParallelExpertEncoder(nn.Module):
                 f"({self.diarization_model.output_subsampling_factor}) to equal the ASR encoder subsampling factor "
                 f"({self.asr_encoder.subsampling_factor})."
             )
+        self.diar_normalize_type = _resolve_diar_normalize_type(
+            diar_normalize_type, _diarizer_own_normalize(diarization_model_cfg, self.diarization_model)
+        )
 
         # None = each branch keeps its own flag. Recorded so the SpeechLM mounts can tell an explicit
         # PE-level setting, which wins, from an unset one.
@@ -804,6 +817,10 @@ class ParallelExpertEncoder(nn.Module):
         ``NA``/``null`` disables the replay, and ``per_feature``/``all_features`` are replayed as
         given. Any other checkpoint value, or none, raises. The resolved value is the encoder's
         ``asr_normalize_type`` attribute.
+
+        Diarizer normalization: an absent ``diar_normalize_type`` keeps the diarizer checkpoint's own
+        ``preprocessor.normalize``, and an explicit one overrides it, on both encoder classes (see
+        ``diar_normalize_type`` in the class docstring).
 
         Each source may be a local ``.nemo`` path or a pretrained model id (a HuggingFace Hub
         ``{repo}/{name}`` or an NGC alias), resolved the same way :meth:`load_from_nemo` resolves
@@ -956,6 +973,26 @@ class ParallelExpertEncoder(nn.Module):
             if value is not _DIAR_UNSET and value is not None:
                 setattr(sm, name, int(value))
         self.diarization_model._check_streaming_parameters()
+
+    def _normalize_diar_input(self, audio_signal: torch.Tensor, length: torch.Tensor) -> torch.Tensor:
+        """Apply ``diar_normalize_type`` to the diarizer branch's mels, with the statistics of each row given.
+
+        The offline forward and online inference pass whole utterances; the streaming step of
+        :class:`StreamingParallelExpertEncoder` passes one chunk.
+
+        Args:
+            audio_signal (Tensor): Un-normalised mel features. Shape ``(B, feat_in, n_frames)``.
+            length (Tensor): Per-sample feature lengths. Shape ``(B,)``.
+
+        Returns:
+            The normalized mels, or ``audio_signal`` itself when ``diar_normalize_type`` is ``None``.
+        """
+        if not self.diar_normalize_type:
+            return audio_signal
+        normalized, _, _ = normalize_batch(
+            audio_signal, length.to(device=audio_signal.device), normalize_type=self.diar_normalize_type
+        )
+        return normalized
 
     def apply_internal_freeze(self) -> None:
         """(Re-)apply this encoder's own ``freeze_diar`` / ``freeze_asr`` policy.
@@ -1296,8 +1333,11 @@ class ParallelExpertEncoder(nn.Module):
         needs_diar = self._should_run_diarization(spk_targets, missing_rows)
         diar_preds = None
         if needs_diar:
-            # Cast fp32 mels to the diarizer's device/dtype before its conv subsampling.
-            diar_signal = self._match_module_io(audio_signal, self.diarization_model)
+            # Normalise as `diar_normalize_type` says, then cast the fp32 mels to the diarizer's
+            # device/dtype before its conv subsampling.
+            diar_signal = self._match_module_io(
+                self._normalize_diar_input(audio_signal, length), self.diarization_model
+            )
             diar_length = length.to(device=diar_signal.device)
             with torch.set_grad_enabled(not self.freeze_diar):
                 emb_seq, emb_seq_length = self.diarization_model.frontend_encoder(
@@ -1393,8 +1433,9 @@ class ParallelExpertEncoder(nn.Module):
 
         run_streaming_diar = spk_targets is None
         if run_streaming_diar:
+            # Like the ASR branch, the diarizer's normalization uses the whole utterance's statistics.
             streaming_state, stream_dtype, diar_audio_signal, diar_length = self._init_streaming_diar(
-                audio_signal,
+                self._normalize_diar_input(audio_signal, length),
                 length,
                 batch_size=audio_signal.shape[0],
             )
@@ -1514,8 +1555,12 @@ class StreamingParallelExpertEncoder(ParallelExpertEncoder, StreamingEncoder):
     capability** -- it exposes the branch's existing machinery through the wrapper and steps the
     Sortformer in lock-step on the same mel chunk so the fusion stays frame-aligned.
 
-    Offline behaviour is inherited unchanged; mount this class instead of the base whenever the
-    perception stack will be driven chunk-by-chunk.
+    Offline behaviour is inherited unchanged, including the normalisation of the diarizer input
+    (``diar_normalize_type``: by default the diarizer's own), over the whole utterance. The streaming
+    step applies it to each chunk on its own, as it does ``asr_normalize_type`` to the ASR input, so a
+    stream then feeds the diarizer differently normalised mels than the offline (training) forward
+    does; the first normalisation logs a warning saying so, once. Mount this class instead of the base
+    whenever the perception stack will be driven chunk-by-chunk.
     """
 
     # ------------------------------------------------------------------
@@ -1532,6 +1577,25 @@ class StreamingParallelExpertEncoder(ParallelExpertEncoder, StreamingEncoder):
     _diar_stream_dtype = None
     # Whether the current stream steps the diarizer; ``None`` until its first chunk.
     _diar_stream_source = None
+    # Whether the one-time warning about normalising the diarizer input has been logged.
+    _diar_normalization_warned = False
+
+    def _normalize_diar_input(self, audio_signal: torch.Tensor, length: torch.Tensor) -> torch.Tensor:
+        """Normalise as the base class does; the first time there is a normalisation to apply, warn once.
+
+        The streaming step normalises each chunk with that chunk's statistics, while the offline (training)
+        forward and online inference use the whole utterance's, so the diarizer input differs between them.
+        """
+        if self.diar_normalize_type and not self._diar_normalization_warned:
+            self._diar_normalization_warned = True
+            logging.warning(
+                "[StreamingParallelExpertEncoder] Normalizing the diarizer input with %r (diar_normalize_type). "
+                "The streaming step (cache_aware_stream_step) normalizes each chunk on its own, while the offline "
+                "(training) forward and online inference normalize the whole utterance, so the diarizer receives "
+                "differently normalized mels when streaming than in training. Logged once.",
+                self.diar_normalize_type,
+            )
+        return super()._normalize_diar_input(audio_signal, length)
 
     @property
     def streaming_cfg(self):
@@ -1696,10 +1760,11 @@ class StreamingParallelExpertEncoder(ParallelExpertEncoder, StreamingEncoder):
                 "ParallelExpertEncoder.cache_aware_stream_step requires get_initial_cache_state() first "
                 "-- it is what allocates the diarizer's streaming state."
             )
-        diar_signal = processed_signal.to(
-            device=self._diar_total_preds.device, dtype=self._diar_stream_dtype
-        ).transpose(
-            1, 2
+        # Normalise this chunk on its own, as `cache_aware_stream_step` does the ASR input, then cast.
+        diar_signal = (
+            self._normalize_diar_input(processed_signal, processed_signal_length)
+            .to(device=self._diar_total_preds.device, dtype=self._diar_stream_dtype)
+            .transpose(1, 2)
         )  # (B, t, feat_in)
         diar_len = processed_signal_length.to(device=diar_signal.device)
         prev_len = self._diar_total_preds.shape[1]
@@ -1748,7 +1813,9 @@ class StreamingParallelExpertEncoderPT(ParallelExpertEncoderPT):
 
     Identical archive layout to :class:`ParallelExpertEncoderPT`; only the encoder class differs, so
     a bundle built for one can be re-targeted at the other by changing ``target`` in its
-    ``model_config.yaml``.
+    ``model_config.yaml``. Both classes read the bundle's ``diar_normalize_type`` the same way (unset,
+    the diarizer's own ``preprocessor.normalize``; set, an override, also through ``config_overrides``
+    of :meth:`load_from_nemo`), and this one also applies it to each chunk in its streaming step.
     """
 
     _ENCODER_CLS = StreamingParallelExpertEncoder
@@ -1796,12 +1863,92 @@ def _resolve_branch_source(path_or_name: str, model_cls, map_location):
     return OmegaConf.to_container(model.cfg, resolve=True), model.state_dict()
 
 
-def _checkpoint_normalize(asr_cfg, default=_NORMALIZE_UNSET):
-    """Return the ASR checkpoint config's ``preprocessor.normalize``, or ``default`` when it has none."""
-    preprocessor = asr_cfg.get('preprocessor', None) if isinstance(asr_cfg, Mapping) else None
+def _checkpoint_normalize(cfg, default=_NORMALIZE_UNSET):
+    """Return an ASR or diarizer config's ``preprocessor.normalize``, or ``default`` when it has none."""
+    preprocessor = cfg.get('preprocessor', None) if isinstance(cfg, Mapping) else None
     if not isinstance(preprocessor, Mapping) or 'normalize' not in preprocessor:
         return default
     return preprocessor['normalize']
+
+
+def _resolve_diar_normalize_type(diar_normalize_type, diarizer_normalize) -> Optional[str]:
+    """Resolve ``diar_normalize_type`` to the normalization of the diarizer input, and log the result.
+
+    Unset keeps the diarizer's own normalization; an explicit value overrides it. Both encoder classes
+    resolve it this way.
+
+    Args:
+        diar_normalize_type: The constructor argument, or ``_NORMALIZE_UNSET``.
+        diarizer_normalize: The ``normalize`` of the diarizer's own preprocessor.
+
+    Returns:
+        ``'per_feature'``, ``'all_features'``, or ``None`` for no normalization.
+
+    Raises:
+        ValueError: If the value to apply is not a normalization the diarizer branch can apply.
+    """
+    if diar_normalize_type is _NORMALIZE_UNSET:
+        resolved = _diar_normalize_type_from_value(
+            diarizer_normalize,
+            "The diarizer's preprocessor.normalize",
+            "; set diar_normalize_type explicitly",
+        )
+        source = f"the diarizer's own preprocessor.normalize={diarizer_normalize!r}"
+    else:
+        resolved = _diar_normalize_type_from_value(diar_normalize_type, "diar_normalize_type")
+        source = (
+            f"diar_normalize_type={diar_normalize_type!r}, over the diarizer's own "
+            f"preprocessor.normalize={diarizer_normalize!r}"
+        )
+    logging.info(
+        "[ParallelExpertEncoder] The diarizer branch input is %s, from %s.",
+        f"normalized with {resolved!r}" if resolved else "not normalized",
+        source,
+    )
+    return resolved
+
+
+def _diarizer_own_normalize(diarization_model_cfg, diarization_model):
+    """The ``normalize`` of the diarizer's own preprocessor, which it was trained with.
+
+    Read from the config's ``preprocessor.normalize``. A config without it gets the preprocessor's own
+    default, so that is read off the preprocessor built from it.
+    """
+    normalize = _checkpoint_normalize(diarization_model_cfg)
+    if normalize is _NORMALIZE_UNSET:
+        featurizer = getattr(getattr(diarization_model, 'preprocessor', None), 'featurizer', None)
+        normalize = getattr(featurizer, 'normalize', None)
+    return normalize
+
+
+def _diar_normalize_type_from_value(value, source: str, hint: str = "") -> Optional[str]:
+    """Map a diarizer normalization value to the one the diarizer branch applies, ``None`` for none.
+
+    ``NA``, ``null`` or an empty value mean no normalization; ``per_feature`` and ``all_features`` are
+    applied as given. Anything else raises, because the diarizer branch applies only these, and
+    ``normalize_batch`` would skip an unknown string without a word. A ``fixed_mean``/``fixed_std`` dict,
+    which ``normalize_batch`` does apply, is rejected as well.
+    """
+    if not value or value == 'NA':
+        return None
+    if isinstance(value, str) and value in _DIAR_NORMALIZE_TYPES:
+        return value
+    raise ValueError(
+        f"{source}={value!r} is not a normalization the ParallelExpertEncoder diarizer branch can apply: use "
+        f"one of {list(_DIAR_NORMALIZE_TYPES)}, or null/'NA' for none{hint}."
+    )
+
+
+def _persisted_diar_normalize_type(encoder) -> str:
+    """``encoder``'s effective ``diar_normalize_type`` as this module's bundle configs state it, ``'NA'`` for none.
+
+    That is the bundle config the encoder keeps and the one ``save_to_nemo`` writes. ``'NA'`` and not null: a
+    serializer that drops null values would turn it into an absent key, which means "the diarizer's own
+    normalization" and could then normalise a diarizer this encoder does not. An HF export (``to_hf.py``)
+    overwrites it with the encoder's ``diar_normalize_type`` attribute, null for none; both reload as no
+    normalization.
+    """
+    return encoder.diar_normalize_type or 'NA'
 
 
 def _asr_normalize_type_from_checkpoint(asr_cfg, source):

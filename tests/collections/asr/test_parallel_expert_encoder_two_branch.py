@@ -40,9 +40,8 @@ from nemo.collections.asr.parts.preprocessing.features import normalize_batch, n
 
 # Tests marked ``pleasefixme`` use upstream ParallelExpertEncoder API that this branch has not ported (e.g.
 # ``asr_encoder_type``, ``_run_diarization``, ``forward_sequence_packed``), or expect upstream behaviour that this
-# branch's PE changes by design: its diarizer gets un-normalised mels (no per-feature ``diar_normalize_type``), and
-# a bundle without a speaker-feature contract loads with a warning instead of failing. Remove a mark once its test
-# passes: port the API it uses, and rewrite any assertion this branch's design rules out.
+# branch's PE changes by design: a bundle without a speaker-feature contract loads with a warning instead of failing.
+# Remove a mark once its test passes: port the API it uses, and rewrite any assertion this branch's design rules out.
 
 _PEE = getattr(ParallelExpertEncoder, "__wrapped__", ParallelExpertEncoder)
 
@@ -791,7 +790,6 @@ def test_online_inference_runs_two_real_branches_with_conformer_io():
     assert torch.equal(external_lengths, output_lengths)
 
 
-@pytest.mark.pleasefixme
 @pytest.mark.unit
 def test_online_inference_passes_normalized_time_major_mels_to_sortformer(monkeypatch):
     """Sortformer receives normalized time-major features before its pre-encoder."""
@@ -948,7 +946,6 @@ def test_strict_two_branch_bundle_loading(tmp_path, asr_encoder_type, asr_encode
         torch.testing.assert_close(restored.state_dict()[key], value)
 
 
-@pytest.mark.pleasefixme
 @pytest.mark.unit
 def test_inline_config_reconstructs_architecture_without_standalone_weights():
     config = bundle_config(chunk_size_seconds=30.0)

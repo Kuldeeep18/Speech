@@ -188,7 +188,7 @@ def _maybe_mount_pe_encoder(
     if ref_param is not None:
         pe_encoder = pe_encoder.to(device=ref_param.device, dtype=ref_param.dtype)
 
-    # The replacement consumes un-normalised mels and applies ASR normalization internally.
+    # The replacement consumes un-normalised mels and applies the ASR and diarizer normalization internally.
     try:
         perception.preprocessor.featurizer.normalize = None
     except AttributeError:
