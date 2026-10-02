@@ -98,7 +98,9 @@ def run_stat_tests(
             across all benchmarks.
 
     Returns:
-        List of StatTestResult instances for configured distribution metrics.
+        List of StatTestResult instances for configured distribution metrics. Metrics
+        restricted to a context type are skipped when the benchmark scope contains no
+        benchmark generated with that context type.
 
     Raises:
         ValueError: If metric samples are missing or benchmark data is invalid.
@@ -106,14 +108,11 @@ def run_stat_tests(
     results = []
 
     for metric in DistributionMetricsRegistry:
-        if metric.optional:
-            baseline_has_metric = bucket_baseline.has_metric_samples(metric.key, benchmark_name)
-            candidate_has_metric = bucket_candidate.has_metric_samples(metric.key, benchmark_name)
-            if not baseline_has_metric or not candidate_has_metric:
-                continue
+        if not bucket_baseline.has_context_type(metric.context_type, benchmark_name):
+            continue
 
-        baseline = bucket_baseline.get_metric_samples(metric.key, benchmark_name)
-        candidate = bucket_candidate.get_metric_samples(metric.key, benchmark_name)
+        baseline = bucket_baseline.get_metric_samples(metric.key, benchmark_name, metric.context_type)
+        candidate = bucket_candidate.get_metric_samples(metric.key, benchmark_name, metric.context_type)
         winner, alternative, p_value = _run_single_stat_test(
             baseline=baseline,
             candidate=candidate,

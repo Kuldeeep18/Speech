@@ -189,12 +189,24 @@ directory name, using the format `%Y-%m-%dT%H-%M-%SZ`, so uploaded reports
 can be filtered and deleted later if needed.
 - Both generated reports include a clickable Jira link derived from `--task_id`. 
 If no task ID is specified, the link points to the Jira project page.
+- Metrics that compare generated audio with the context audio (`SSIM (pred vs context)`) are
+reported only for benchmarks generated with audio context. In the summary section they are
+macro-averaged and pooled across audio-context benchmarks only, and they are omitted from the
+sections of text-context benchmarks (names ending with `_ct_text`).
 
 ## Maintenance
 
 ### Updating benchmarks
 
-To add or remove a benchmark, update `SUPPORTED_BENCHMARK_NAMES` in `reporting/constants.py`.
+Supported benchmarks are declared in `BENCHMARK_META` in `reporting/constants.py`. Each entry maps
+a benchmark name to a `BenchmarkMeta` holding its language code and the context type used when
+the benchmark was generated:
+- `ContextType.audio` (default) - speaker identity was conditioned on a context audio prompt;
+- `ContextType.text` - speaker identity was conditioned on a text description, so no context audio exists.
+
+To add or remove a benchmark, update `BENCHMARK_META`; `SUPPORTED_BENCHMARK_NAMES` is derived from it.
+Declare text-context benchmarks explicitly, otherwise the report fails because their context
+speaker-similarity values are NaN.
 
 ### Updating metrics
 
@@ -207,6 +219,16 @@ The metric specifications are defined in `reporting/metrics/specs.py`.
 To add or remove a metric, update the metric registries in `reporting/metrics/registry.py`:
 - `MetricsRegistry` - for standard aggregated metrics;
 - `DistributionMetricsRegistry` - for metrics used in statistical tests and visualizations.
+
+Two spec attributes control when a metric is reported:
+- `optional` - the metric may be missing from the aggregated metrics JSON (for example
+`ssim_pred_gt_avg` when no ground-truth audio exists); missing values are skipped instead of
+failing the report.
+- `context_type` - the metric is reported only for benchmarks generated with this context type.
+`ssim_pred_context_avg` and `pred_context_ssim` are restricted to `ContextType.audio`: they are
+omitted from text-context benchmark sections, and the summary table and pooled statistical tests
+use audio-context benchmarks only. For audio-context benchmarks these metrics are required, so
+missing or NaN values fail report generation instead of being silently dropped.
 
 ### Modifying bucket structure
 

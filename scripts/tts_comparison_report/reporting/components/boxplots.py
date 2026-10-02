@@ -199,10 +199,12 @@ def prepare_boxplots(
             baseline = bucket_baseline.get_metric_samples(
                 metric_name=metric.key,
                 benchmark_name=benchmark_name,
+                context_type=metric.context_type,
             )
             candidate = bucket_candidate.get_metric_samples(
                 metric_name=metric.key,
                 benchmark_name=benchmark_name,
+                context_type=metric.context_type,
             )
             baseline = np.asarray(baseline, dtype=float)
             candidate = np.asarray(candidate, dtype=float)

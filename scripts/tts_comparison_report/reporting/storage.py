@@ -16,9 +16,11 @@ import json
 from abc import ABC, abstractmethod
 from pathlib import Path
 from stat import S_ISDIR
-from typing import Any, BinaryIO, Generator
+from typing import TYPE_CHECKING, Any, BinaryIO, Generator
 
-from paramiko.sftp_client import SFTPClient
+if TYPE_CHECKING:
+    # paramiko is only needed for the SFTP backend; keep the module importable without it.
+    from paramiko.sftp_client import SFTPClient
 
 
 class BaseStorage(ABC):
@@ -126,7 +128,7 @@ class LocalStorage(BaseStorage):
 class SFTPStorage(BaseStorage):
     """Storage backend for accessing artifacts on a remote host over SFTP."""
 
-    def __init__(self, sftp: SFTPClient) -> None:
+    def __init__(self, sftp: "SFTPClient") -> None:
         super().__init__()
         self.sftp = sftp
 
