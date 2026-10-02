@@ -243,3 +243,15 @@ def _assert_exact_restored_state(probe, checkpoint):
     torch.testing.assert_close(probe.restored['model'], checkpoint['state_dict'], rtol=0, atol=0)
     torch.testing.assert_close(probe.restored['optimizer'], checkpoint['optimizer_states'][0], rtol=0, atol=0)
     assert probe.restored['scheduler'] == checkpoint['lr_schedulers'][0]
+
+
+@pytest.fixture(autouse=True)
+def _cpu_default_device():
+    """Keep CPU checkpoint and Adam allocations independent of other tests' defaults.
+
+    Some SpeechLM test modules select CUDA at import time. Adam's step counter
+    otherwise inherits that default even though Lightning uses a CPU trainer.
+    The context restores the enclosing default device after each test.
+    """
+    with torch.device('cpu'):
+        yield

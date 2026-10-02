@@ -479,8 +479,11 @@ class TestASRModulesBasicTests:
         from nemo.collections.asr.modules import audio_preprocessing
 
         monkeypatch.setattr(audio_preprocessing, "NUMBA_CUDA_AVAILABLE", numba_available)
-        # Exercise backend selection on CPU without launching a CUDA kernel.
-        monkeypatch.setattr(audio_preprocessing, "SpecAugmentNumba", lambda **kwargs: torch.nn.Identity())
+        # CPU-only imports omit this optional symbol; install the mock explicitly.
+        monkeypatch.delattr(audio_preprocessing, "SpecAugmentNumba", raising=False)
+        monkeypatch.setattr(
+            audio_preprocessing, "SpecAugmentNumba", lambda **kwargs: torch.nn.Identity(), raising=False
+        )
         monkeypatch.setattr(logging._logger, "propagate", True)
         kwargs = {
             "time_masks": 10,
