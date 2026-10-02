@@ -301,7 +301,8 @@ class BucketData:
             bucket_path: Path to the bucket root directory.
             bucket_structure: Bucket naming and path conventions.
             benchmark_names: Benchmark names expected in the bucket.
-            check_audio: Whether generated audio files should also be discovered.
+            check_audio: Whether generated audio files should also be discovered. Audio
+                discovery is skipped for text-context benchmarks, which have no context audio.
             storage: Storage instance used to access local or remote files.
 
         Returns:
@@ -332,7 +333,7 @@ class BucketData:
                 benchmark_name=name,
                 benchmark_path=benchmark_path,
                 bucket_structure=bucket_structure,
-                check_audio=check_audio,
+                check_audio=check_audio and BENCHMARK_META[name].context_type == ContextType.audio,
                 storage=storage,
             )
             if obj.configuration_str is None:

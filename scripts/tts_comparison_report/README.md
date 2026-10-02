@@ -193,6 +193,9 @@ If no task ID is specified, the link points to the Jira project page.
 reported only for benchmarks generated with audio context. In the summary section they are
 macro-averaged and pooled across audio-context benchmarks only, and they are omitted from the
 sections of text-context benchmarks (names ending with `_ct_text`).
+- Text-context benchmarks have no context audio, so they cannot be listed in
+`--audio_report_benchmarks`. They can still be part of `--benchmarks` when `--audio_report` is enabled;
+audio discovery is skipped for them.
 
 ## Maintenance
 
