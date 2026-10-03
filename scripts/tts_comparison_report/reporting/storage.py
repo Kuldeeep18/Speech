@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
+
 import errno
 import json
 from abc import ABC, abstractmethod
@@ -18,8 +20,7 @@ from pathlib import Path
 from stat import S_ISDIR
 from typing import TYPE_CHECKING, Any, BinaryIO, Generator
 
-if TYPE_CHECKING:
-    # paramiko is only needed for the SFTP backend; keep the module importable without it.
+if TYPE_CHECKING:  # paramiko is only needed by callers that construct an SFTPStorage (generate_report.py)
     from paramiko.sftp_client import SFTPClient
 
 
@@ -128,7 +129,7 @@ class LocalStorage(BaseStorage):
 class SFTPStorage(BaseStorage):
     """Storage backend for accessing artifacts on a remote host over SFTP."""
 
-    def __init__(self, sftp: "SFTPClient") -> None:
+    def __init__(self, sftp: SFTPClient) -> None:
         super().__init__()
         self.sftp = sftp
 
