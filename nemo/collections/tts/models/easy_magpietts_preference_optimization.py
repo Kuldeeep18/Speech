@@ -146,7 +146,6 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
                 )
         self._reward_asr_router = RewardASRRouter(reward_asr_cfg, device_getter=lambda: self.device)
         self.reward_asr_log_samples = max(int(reward_asr_cfg.get("log_samples", 0)), 0)
-        self.use_multilingual_asr = True
 
         self._eval_speaker_verification_model = nemo_asr.models.EncDecSpeakerLabelModel.from_pretrained(
             model_name=cfg.get('speaker_verification_model_name', 'titanet_large')
@@ -730,6 +729,28 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
                 )
                 logged_languages[language] = num_logged + 1
         return pred_transcripts
+
+    def _transcribe_for_validation(self, predicted_audio_paths: List[str], batch: Dict) -> List[Optional[str]]:
+        """Transcribe validation audio through the reward ASR router unless ``validation_asr_backend='default'``.
+
+        Unless ``cfg.run_val_inference=True``, the PO model does not load the base-class validation ASR models
+        (``whisper_model`` / ``_eval_asr_model``), so validation CER/WER use the same language-routed reward ASR
+        backends as the training rewards. Setting ``cfg.validation_asr_backend='default'`` restores the base
+        dispatch (Whisper or NeMo ASR); it requires ``cfg.run_val_inference=True`` so the base class loads those
+        models.
+        """
+        if self.cfg.get('validation_asr_backend') == 'default':
+            return super()._transcribe_for_validation(predicted_audio_paths, batch)
+        return self._compute_pred_transcripts(predicted_audio_paths, batch)
+
+    def _should_log_per_language_val_metrics(self) -> bool:
+        """Always aggregate validation CER/WER per language.
+
+        The reward ASR router that transcribes validation audio is language-routed, so ``val/cer_lang_<lang>`` and
+        ``val/wer_lang_<lang>`` are meaningful regardless of the base-class ``use_multilingual_asr`` flag, which
+        only selects the base-class Whisper validation ASR.
+        """
+        return True
 
     def _compute_speaker_embeddings_parallel(
         self, predicted_audio_paths: List[str], batch: Dict, num_generations_per_item: int

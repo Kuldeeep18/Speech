@@ -1714,57 +1714,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             if predicted_audio_paths and context_audio_paths:
                 with torch.no_grad():
                     # ASR transcription for CER/WER
-                    validation_asr_backend = self.cfg.get('validation_asr_backend', 'default')
-                    if validation_asr_backend == 'reward':
-                        if not hasattr(self, '_compute_pred_transcripts'):
-                            raise RuntimeError(
-                                "validation_asr_backend='reward' requires reward ASR transcription support"
-                            )
-                        pred_transcripts = self._compute_pred_transcripts(predicted_audio_paths, batch)
-                    elif self.use_multilingual_asr:
-                        self.whisper_model.to(self.device)
-                        languages = batch.get('languages', None)
-                        if languages is None:
-                            languages = ['en'] * len(predicted_audio_paths)
-                        try:
-                            transcripts = transcribe_with_whisper_from_filepaths(
-                                audio_filepaths=predicted_audio_paths,
-                                language=languages,
-                                whisper_processor=self.whisper_processor,
-                                whisper_model=self.whisper_model,
-                                device=self.device,
-                                normalizer=None,
-                            )
-                            pred_transcripts = [process_text_for_cer(transcript) for transcript in transcripts]
-                        except Exception as e:
-                            logging.warning(
-                                f"Val batched ASR transcription failed, falling back to per-file mode: {e}"
-                            )
-                            pred_transcripts = []
-                            for item_idx, audio_path in enumerate(predicted_audio_paths):
-                                lang = languages[item_idx] if item_idx < len(languages) else 'en'
-                                try:
-                                    transcript = transcribe_with_whisper(
-                                        audio_path,
-                                        lang,
-                                        self.whisper_processor,
-                                        self.whisper_model,
-                                        self.device,
-                                        normalizer=None,
-                                    )
-                                    pred_transcripts.append(process_text_for_cer(transcript))
-                                except Exception as inner_e:
-                                    logging.warning(f"Val ASR transcription failed for {audio_path}: {inner_e}")
-                                    pred_transcripts.append(None)
-                    else:
-                        pred_transcripts = self._eval_asr_model.transcribe(
-                            predicted_audio_paths,
-                            batch_size=len(predicted_audio_paths),
-                            override_config=TranscribeConfig(
-                                use_lhotse=False, batch_size=len(predicted_audio_paths), num_workers=0
-                            ),
-                        )
-                        pred_transcripts = [process_text_for_cer(t.text) for t in pred_transcripts]
+                    pred_transcripts = self._transcribe_for_validation(predicted_audio_paths, batch)
 
                     # Speaker embeddings for SSIM
                     try:
@@ -1848,7 +1798,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                     if batch_cer:
                         val_output['val_cer'] = torch.tensor(np.mean(batch_cer), device=self.device)
                         val_output['val_wer'] = torch.tensor(np.mean(batch_wer), device=self.device)
-                        if self.use_multilingual_asr:
+                        if self._should_log_per_language_val_metrics():
                             langs = batch.get('languages', ['en'] * len(predicted_audio_paths))
                             val_output['val_languages'] = [
                                 langs[i] for i in range(len(pred_transcripts)) if pred_transcripts[i] is not None
@@ -1863,6 +1813,87 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         self.validation_step_outputs.append(val_output)
 
         return val_output
+
+    def _transcribe_for_validation(self, predicted_audio_paths: List[str], batch: dict) -> List[Optional[str]]:
+        """Transcribe generated validation audio for CER/WER, dispatching on the ``validation_asr_backend`` key.
+
+        ``cfg.validation_asr_backend`` selects the ASR used for validation metrics:
+
+        * ``"default"`` (used when the key is absent): the validation ASR models loaded in ``__init__`` when
+          ``run_val_inference`` is enabled. Whisper is used when ``use_multilingual_asr`` is set (batched first,
+          then a per-file fallback with ``None`` for files that still fail), otherwise the NeMo ``_eval_asr_model``.
+        * ``"reward"``: ``self._compute_pred_transcripts`` (the language-routed reward ASR of the preference
+          optimization model). Raises ``RuntimeError`` when the model does not provide that method.
+
+        Subclasses override this method to change the default; ``EasyMagpieTTSModelOnlinePO`` routes through its
+        reward ASR router unless ``"default"`` is requested explicitly.
+
+        Args:
+            predicted_audio_paths: Paths of the generated validation audio files.
+            batch: Validation batch; ``batch['languages']`` selects the language per item when present.
+
+        Returns:
+            Normalized predicted transcripts in the order of ``predicted_audio_paths``. Entries are ``None`` for
+            files whose per-file Whisper fallback failed.
+        """
+        validation_asr_backend = self.cfg.get('validation_asr_backend', 'default')
+        if validation_asr_backend == 'reward':
+            if not hasattr(self, '_compute_pred_transcripts'):
+                raise RuntimeError("validation_asr_backend='reward' requires reward ASR transcription support")
+            pred_transcripts = self._compute_pred_transcripts(predicted_audio_paths, batch)
+        elif self.use_multilingual_asr:
+            self.whisper_model.to(self.device)
+            languages = batch.get('languages', None)
+            if languages is None:
+                languages = ['en'] * len(predicted_audio_paths)
+            try:
+                transcripts = transcribe_with_whisper_from_filepaths(
+                    audio_filepaths=predicted_audio_paths,
+                    language=languages,
+                    whisper_processor=self.whisper_processor,
+                    whisper_model=self.whisper_model,
+                    device=self.device,
+                    normalizer=None,
+                )
+                pred_transcripts = [process_text_for_cer(transcript) for transcript in transcripts]
+            except Exception as e:
+                logging.warning(f"Val batched ASR transcription failed, falling back to per-file mode: {e}")
+                pred_transcripts = []
+                for item_idx, audio_path in enumerate(predicted_audio_paths):
+                    lang = languages[item_idx] if item_idx < len(languages) else 'en'
+                    try:
+                        transcript = transcribe_with_whisper(
+                            audio_path,
+                            lang,
+                            self.whisper_processor,
+                            self.whisper_model,
+                            self.device,
+                            normalizer=None,
+                        )
+                        pred_transcripts.append(process_text_for_cer(transcript))
+                    except Exception as inner_e:
+                        logging.warning(f"Val ASR transcription failed for {audio_path}: {inner_e}")
+                        pred_transcripts.append(None)
+        else:
+            pred_transcripts = self._eval_asr_model.transcribe(
+                predicted_audio_paths,
+                batch_size=len(predicted_audio_paths),
+                override_config=TranscribeConfig(
+                    use_lhotse=False, batch_size=len(predicted_audio_paths), num_workers=0
+                ),
+            )
+            pred_transcripts = [process_text_for_cer(t.text) for t in pred_transcripts]
+        return pred_transcripts
+
+    def _should_log_per_language_val_metrics(self) -> bool:
+        """Return whether validation also aggregates CER/WER per language (``val/{cer,wer}_lang_<lang>``).
+
+        ``validation_step`` collects the per-item languages and CER/WER lists, and ``on_validation_epoch_end``
+        logs the per-language means, only when this returns True. The base model ties it to
+        ``use_multilingual_asr``, i.e. to the multilingual Whisper validation ASR; subclasses whose validation
+        ASR is language-aware by other means override this hook.
+        """
+        return self.use_multilingual_asr
 
     def on_fit_start(self):
         super().on_fit_start()
@@ -1903,7 +1934,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 if metric_value is not None:
                     self.log(val_metric.replace("val_", "val/", 1), metric_value, prog_bar=True, sync_dist=True)
 
-            if self.use_multilingual_asr:
+            if self._should_log_per_language_val_metrics():
                 lang_cer = {}
                 lang_wer = {}
                 for x in self.validation_step_outputs:
