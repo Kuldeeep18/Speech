@@ -228,13 +228,25 @@ class ProcessRewardASRBackend(RewardASRBackend):
         return json.loads(line)
 
     def _start(self) -> None:
+        """Launch the worker process on the same physical GPU as the TTS model.
+
+        The worker is handed a single-entry ``CUDA_VISIBLE_DEVICES`` resolved through the parent's own mask by
+        :func:`_visible_device_for_worker`, so ``--device cuda:0`` inside the worker always denotes the GPU behind
+        ``device_getter()``. For non-CUDA parent devices the parent environment is inherited unchanged.
+
+        Raises:
+            ValueError: If the parent's device index lies outside its ``CUDA_VISIBLE_DEVICES`` mask (raised before
+                the worker process is spawned).
+        """
         if self.process is not None and self.process.poll() is None:
             return
 
         device = self.device_getter()
         device_index = device.index if device.index is not None else 0
         worker_env = os.environ.copy()
-        worker_env["CUDA_VISIBLE_DEVICES"] = str(device_index)
+        visible_device = _visible_device_for_worker(device, worker_env)
+        if visible_device is not None:
+            worker_env["CUDA_VISIBLE_DEVICES"] = visible_device
         stderr_path = os.path.join(
             tempfile.gettempdir(), f"{self.worker_backend}_asr_worker_{os.getpid()}_{device_index}.log"
         )
@@ -267,8 +279,9 @@ class ProcessRewardASRBackend(RewardASRBackend):
         if ready.get("status") != "ready":
             raise RuntimeError(f"Unexpected Qwen ASR worker startup response: {ready}")
         logging.info(
-            f"{self.worker_backend} ASR worker ready on {ready.get('device')} with model {ready.get('model')} "
-            f"(stderr: {stderr_path})"
+            f"{self.worker_backend} ASR worker ready on {ready.get('device')} "
+            f"(CUDA_VISIBLE_DEVICES={worker_env.get('CUDA_VISIBLE_DEVICES', '<unset>')}) "
+            f"with model {ready.get('model')} (stderr: {stderr_path})"
         )
 
     def _request(self, audio_paths: Sequence[str], languages: Sequence[str]) -> List[str]:
@@ -384,3 +397,40 @@ class RewardASRRouter:
     def close(self) -> None:
         for backend in self.backends.values():
             backend.close()
+
+
+def _visible_device_for_worker(device: torch.device, environ: Mapping[str, str]) -> Optional[str]:
+    """Return the ``CUDA_VISIBLE_DEVICES`` entry that pins a worker process to ``device``.
+
+    ``device.index`` is a logical index into the parent's own ``CUDA_VISIBLE_DEVICES`` mask, so exporting
+    ``str(device.index)`` to a worker lands it on the wrong physical GPU whenever that mask is not the identity
+    (for example ``CUDA_VISIBLE_DEVICES=2,3`` or UUID/MIG masks). This helper looks the index up in the parent
+    mask instead.
+
+    Args:
+        device: Device the parent process computes on. A CUDA device without an index is treated as ``cuda:0``.
+        environ: Environment of the parent process, typically ``os.environ`` or a copy of it.
+
+    Returns:
+        The mask entry (GPU ordinal, ``GPU-<uuid>`` or ``MIG-<uuid>``) to export as the worker's
+        ``CUDA_VISIBLE_DEVICES``. When the parent mask is unset (or empty) the logical index is used as-is and
+        ``str(device.index)`` is returned. ``None`` for non-CUDA devices, whose workers inherit the parent
+        environment untouched.
+
+    Raises:
+        ValueError: If ``device.index`` is outside the parent mask.
+    """
+    if device.type != "cuda":
+        return None
+    device_index = device.index if device.index is not None else 0
+    mask = environ.get("CUDA_VISIBLE_DEVICES")
+    if not mask:
+        return str(device_index)
+    entries = [entry.strip() for entry in mask.split(",")]
+    entries = [entry for entry in entries if entry]
+    if device_index >= len(entries):
+        raise ValueError(
+            f"Cannot pin the reward ASR worker: CUDA device index {device_index} is outside the parent "
+            f"CUDA_VISIBLE_DEVICES={mask!r}, which exposes {len(entries)} device(s)"
+        )
+    return entries[device_index]

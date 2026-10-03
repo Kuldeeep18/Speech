@@ -18,9 +18,13 @@ import textwrap
 import pytest
 import torch
 
+from nemo.collections.tts.parts.utils import reward_asr
 from nemo.collections.tts.parts.utils.reward_asr import ProcessRewardASRBackend, RewardASRBackend, RewardASRRouter
 
 pytestmark = pytest.mark.unit
+
+GPU_UUID = "GPU-0f3a6b2c-1234-5678-9abc-def012345678"
+MIG_UUID = f"MIG-{GPU_UUID}/1/0"
 
 
 class FakeBackend(RewardASRBackend):
@@ -115,3 +119,87 @@ def test_qwen_backend_worker_protocol(tmp_path):
     assert backend.transcribe(["a.wav", "b.wav"], ["en", "de"]) == ["en:a.wav", "de:b.wav"]
     backend.close()
     assert backend.process is None
+
+
+@pytest.mark.parametrize(
+    ("mask", "index", "expected"),
+    [
+        ("2,3", 1, "3"),
+        ("2,3", 0, "2"),
+        ("2,3", None, "2"),
+        (" 2 , 3 ,", 1, "3"),
+        (f"{GPU_UUID},{MIG_UUID}", 0, GPU_UUID),
+        (f"{GPU_UUID},{MIG_UUID}", 1, MIG_UUID),
+        (None, 1, "1"),
+        (None, None, "0"),
+        ("", 1, "1"),
+    ],
+)
+def test_visible_device_for_worker_resolves_logical_index_through_parent_mask(mask, index, expected):
+    environ = {} if mask is None else {"CUDA_VISIBLE_DEVICES": mask}
+    device = torch.device("cuda") if index is None else torch.device("cuda", index)
+
+    assert reward_asr._visible_device_for_worker(device, environ) == expected
+
+
+def test_visible_device_for_worker_rejects_index_outside_parent_mask():
+    with pytest.raises(ValueError, match=r"index 1 is outside the parent CUDA_VISIBLE_DEVICES='2'"):
+        reward_asr._visible_device_for_worker(torch.device("cuda", 1), {"CUDA_VISIBLE_DEVICES": "2"})
+
+
+def test_visible_device_for_worker_leaves_non_cuda_devices_untouched():
+    assert reward_asr._visible_device_for_worker(torch.device("cpu"), {"CUDA_VISIBLE_DEVICES": "2,3"}) is None
+    assert reward_asr._visible_device_for_worker(torch.device("cpu"), {}) is None
+
+
+def test_process_backend_pins_worker_to_physical_gpu(tmp_path, monkeypatch):
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        textwrap.dedent(
+            """
+            import argparse
+            import json
+            import os
+            import sys
+
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--backend")
+            parser.add_argument("--model")
+            parser.add_argument("--device")
+            parser.add_argument("--batch-size")
+            parser.add_argument("--max-new-tokens")
+            parser.add_argument("--language-map")
+            args = parser.parse_args()
+            visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+            print(json.dumps({"status": "ready", "model": args.model, "device": args.device}), flush=True)
+            for line in sys.stdin:
+                request = json.loads(line)
+                if request["command"] == "shutdown":
+                    print(json.dumps({"status": "stopped"}), flush=True)
+                    break
+                transcripts = [f"{visible_devices}:{path}" for path in request["audio_paths"]]
+                print(json.dumps({"status": "ok", "transcripts": transcripts}), flush=True)
+            """
+        )
+    )
+    # Rank 1 of a job restricted to physical GPUs 2 and 3 trains on logical cuda:1, i.e. physical GPU 3.
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,3")
+    messages = []
+    monkeypatch.setattr(reward_asr.logging, "info", lambda message, *args, **kwargs: messages.append(message))
+    backend = ProcessRewardASRBackend(
+        {
+            "type": "qwen",
+            "python_executable": sys.executable,
+            "worker_script": str(worker),
+            "timeout_seconds": 10,
+        },
+        device_getter=lambda: torch.device("cuda", 1),
+    )
+
+    try:
+        assert backend.transcribe(["a.wav"], ["en"]) == ["3:a.wav"]
+    finally:
+        backend.close()
+    ready_messages = [message for message in messages if "ASR worker ready" in message]
+    assert len(ready_messages) == 1
+    assert "CUDA_VISIBLE_DEVICES=3" in ready_messages[0]
