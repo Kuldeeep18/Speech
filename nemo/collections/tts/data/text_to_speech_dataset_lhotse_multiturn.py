@@ -131,6 +131,18 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
         text_context_remapping: Dict defining mapping of multiple text contexts to a single text context.
         text_context_remapping_prob: Probability of remapping the original text context to a remapped text context.
         phoneme_turn_max_words_to_drop: Turns with this many words or fewer keep empty phoneme string.
+        challenging_texts_path: Path to a UTF-8 text file with one challenging text per line; blank lines are ignored.
+            Required when `challenging_text_end_prob` > 0.
+        challenging_text_start_prob: Probability, at `challenging_text_start_step`, that one English TTS output-role
+            turn of a training batch gets its transcript replaced by a random challenging text. Defaults to 0.0.
+        challenging_text_end_prob: Replacement probability reached at `challenging_text_end_step` and kept afterwards.
+            Must satisfy 0 <= start_prob <= end_prob <= 1; 0.0 disables the replacement. Defaults to 0.0.
+        challenging_text_start_step: Training step at which the replacement probability starts to grow linearly
+            from `challenging_text_start_prob`; it is 0 before this step. The online preference-optimization model
+            advances the step from its `training_step` through `set_training_step`. Defaults to 0.
+        challenging_text_end_step: Training step at which the replacement probability reaches
+            `challenging_text_end_prob`. Must be greater than `challenging_text_start_step` when the replacement is
+            enabled. Defaults to 0.
         context_audio_shuffle_batch_prob: Probability of replacing valid audio contexts with audio contexts
             from other items in the same training batch. Text contexts are not changed.
     """
@@ -307,7 +319,7 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
                 batch_tokenizer_names.append("english_phoneme")
 
         challenging_text_prob = self.get_challenging_text_replacement_prob()
-        if self.dataset_type == 'train' and random.random() < challenging_text_prob:
+        if self.dataset_type == 'train' and challenging_text_prob > 0.0 and random.random() < challenging_text_prob:
             candidates = [
                 (cut_idx, cut, supervision)
                 for cut_idx, cut in enumerate(cuts)
@@ -336,6 +348,9 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
                         continue
                     uses_normalized_text = supervision.has_custom("normalized_text")
                     original_text = supervision.normalized_text if uses_normalized_text else supervision.text
+                    # `transform_text` copies supervisions shallowly, so `custom` is still shared with the source
+                    # cut; give this copy its own dict before writing the replacement into it.
+                    supervision.custom = dict(supervision.custom or {})
                     supervision.text = replacement_text
                     if uses_normalized_text:
                         supervision.normalized_text = replacement_text
