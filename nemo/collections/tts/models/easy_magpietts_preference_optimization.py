@@ -63,7 +63,13 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
     def __init__(self, cfg: DictConfig, trainer: 'Trainer' = None):
         """Initialize the online PO model, including the frozen reference model, reward ASR/speaker
         verification models, optional UTMOSv2 scorer, and all PO hyper-parameters from ``cfg``.
+
+        ``cfg`` is validated first (see ``_validate_online_po_cfg``), so removed or unsupported keys such as
+        ``inference_cfg_prob`` or an unknown ``validation_asr_backend`` fail before any model is loaded. The frozen
+        reference model is built from a copy of ``cfg`` with ``run_val_inference`` and ``use_utmos`` disabled: it
+        only provides teacher-forced logits and must not load evaluation models of its own.
         """
+        _validate_online_po_cfg(cfg)
         super().__init__(cfg, trainer)
 
         self.run_val_inference = True  # Always run validation inference in PO.
@@ -73,6 +79,10 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         with open_dict(ref_model_cfg):
             ref_model_cfg.train_ds = None
             ref_model_cfg.validation_ds = None
+            # The reference model only provides teacher-forced logits: keep it from loading the validation
+            # ASR / speaker-verification models and the UTMOSv2 scorer.
+            ref_model_cfg.run_val_inference = False
+            ref_model_cfg.use_utmos = False
 
         self.reference_free = self.cfg.get('reference_free', False)
         if not self.reference_free:
@@ -174,9 +184,8 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
             )
         self.audio_sampling_temperature = float(self.cfg.get('inference_temperature', 0.7))
         self.audio_sampling_topk = int(self.cfg.get('inference_topk', 80))
+        # rollout_cfg_mode was validated by _validate_online_po_cfg before any model was loaded.
         self.rollout_cfg_mode = str(self.cfg.get('rollout_cfg_mode', 'off'))
-        if self.rollout_cfg_mode not in {'off', 'alternate'}:
-            raise ValueError(f"rollout_cfg_mode must be one of ['off', 'alternate'], got {self.rollout_cfg_mode!r}.")
         self.inference_cfg_scale = float(self.cfg.get('inference_cfg_scale', 2.5))
         if self.audio_sampling_topk <= 0:
             self.audio_sampling_topk = self.num_all_tokens_per_codebook
@@ -795,6 +804,14 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         )
         return [float(item['predicted_mos']) for item in batch_results]
 
+    def _rollout_uses_cfg(self, rollout_cfg_mode: str) -> bool:
+        """Return whether the current rollout samples with classifier-free guidance.
+
+        ``'alternate'`` uses CFG on every odd ``global_step`` and plain sampling on even steps, so both decoding
+        modes are optimized; ``'off'`` never uses CFG. Validation rollouts always pass ``'off'``.
+        """
+        return rollout_cfg_mode == 'alternate' and int(self.global_step) % 2 == 1
+
     def generate_and_reward(
         self,
         batch: Dict,
@@ -841,7 +858,7 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
                 use_inference_mode=False,
             )
 
-        use_cfg = rollout_cfg_mode == 'alternate' and int(self.global_step) % 2 == 1
+        use_cfg = self._rollout_uses_cfg(rollout_cfg_mode)
         output = run_inference(batch_repeated, use_cfg=use_cfg)
         rollout_cfg_mask = torch.full(
             (len(batch_repeated['raw_texts']),),
@@ -1633,3 +1650,37 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
     def teardown(self, stage: str) -> None:
         self._reward_asr_router.close()
         super().teardown(stage)
+
+
+def _validate_online_po_cfg(cfg: DictConfig) -> None:
+    """Fail fast on online-PO config keys that would otherwise be ignored silently or fail late.
+
+    Runs at the top of ``EasyMagpieTTSModelOnlinePO.__init__`` before any model is loaded. Raises ``ValueError``
+    when:
+
+    * ``inference_cfg_prob`` is set to a non-zero value. The key was replaced by ``rollout_cfg_mode`` and is no
+      longer read, so a recipe that still sets it would silently train without CFG rollouts.
+    * ``rollout_cfg_mode`` is not ``'off'`` or ``'alternate'``.
+    * ``validation_asr_backend`` is set to anything other than ``'default'`` or ``'reward'``.
+    * ``validation_asr_backend='default'`` is combined with a false ``run_val_inference``: the base class loads its
+      validation ASR models only when ``run_val_inference`` is true, so validation would otherwise fail late.
+    """
+    inference_cfg_prob = cfg.get('inference_cfg_prob')
+    if inference_cfg_prob is not None and float(inference_cfg_prob) != 0.0:
+        raise ValueError(
+            f"inference_cfg_prob={inference_cfg_prob} is no longer supported: it was replaced by "
+            "rollout_cfg_mode=off|alternate ('alternate' uses CFG on every odd training step). Remove the key; "
+            "inference_cfg_scale keeps its meaning."
+        )
+    rollout_cfg_mode = str(cfg.get('rollout_cfg_mode', 'off'))
+    if rollout_cfg_mode not in {'off', 'alternate'}:
+        raise ValueError(f"rollout_cfg_mode must be one of ['off', 'alternate'], got {rollout_cfg_mode!r}.")
+    validation_asr_backend = cfg.get('validation_asr_backend')
+    if validation_asr_backend is not None:
+        if validation_asr_backend not in {'default', 'reward'}:
+            raise ValueError(f"validation_asr_backend must be 'default' or 'reward', got {validation_asr_backend!r}.")
+        if validation_asr_backend == 'default' and not cfg.get('run_val_inference', False):
+            raise ValueError(
+                "validation_asr_backend='default' requires run_val_inference=true: the base-class validation ASR "
+                "models are loaded only when run_val_inference is true."
+            )

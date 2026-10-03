@@ -1999,6 +1999,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         # TODO @xueyang: better to distinguish cfg. self.cfg is the model cfg, while cfg here is train_ds cfg. Also
         #   cfg is a classifier-free guidance.
         if self.cfg.get("use_multiturn_dataset", False):
+            _check_challenging_text_dataset_keys(dataset_cfg.dataset)
             dataset = MagpieTTSLhotseMultiturnDataset(
                 sample_rate=self.sample_rate,
                 volume_norm=dataset_cfg.volume_norm,
@@ -2197,3 +2198,20 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
 
         self._val_dl_wrapped_with_dist_sampler = True
         return self._validation_dl
+
+
+def _check_challenging_text_dataset_keys(dataset_cfg: DictConfig) -> None:
+    """Reject the removed ``challenging_text_replacement_prob`` dataset key.
+
+    The constant replacement probability was replaced by the linear schedule ``challenging_text_start_prob`` /
+    ``challenging_text_end_prob`` / ``challenging_text_start_step`` / ``challenging_text_end_step`` that
+    ``get_lhotse_dataloader`` reads; a recipe that still sets the old key would otherwise silently train without
+    challenging-text replacement.
+    """
+    if "challenging_text_replacement_prob" in dataset_cfg:
+        raise ValueError(
+            "challenging_text_replacement_prob was replaced by challenging_text_start_prob / "
+            "challenging_text_end_prob / challenging_text_start_step / challenging_text_end_step; remove the key "
+            "and configure the schedule instead (a constant probability p is challenging_text_start_prob="
+            "challenging_text_end_prob=p with challenging_text_start_step=0 and challenging_text_end_step=1)."
+        )

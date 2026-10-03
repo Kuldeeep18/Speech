@@ -19,6 +19,8 @@ import torch
 from omegaconf import OmegaConf
 
 from nemo.collections.asr.parts.mixins.transcription import TranscribeConfig
+from nemo.collections.tts.models import easy_magpietts as easy_magpietts_module
+from nemo.collections.tts.models import easy_magpietts_preference_optimization as po_module
 from nemo.collections.tts.models.easy_magpietts import EasyMagpieTTSModel
 from nemo.collections.tts.models.easy_magpietts_preference_optimization import EasyMagpieTTSModelOnlinePO
 from nemo.collections.tts.modules.magpietts_modules import LocalTransformerType
@@ -44,6 +46,10 @@ def _make_validation_asr_model(model_cls, cfg):
     torch.nn.Module.__init__(model)
     model._cfg = OmegaConf.create(cfg)
     return model
+
+
+class _ReferenceModelConstructed(Exception):
+    """Raised by the patched base ``__init__`` once the PO model starts building its frozen reference copy."""
 
 
 def _make_validation_epoch_end_model(model_cls, cfg, use_multilingual_asr):
@@ -245,3 +251,119 @@ def test_base_validation_epoch_end_per_language_cer_wer_follow_multilingual_asr_
         assert per_language_keys == ["val/cer_lang_de", "val/cer_lang_en", "val/wer_lang_de", "val/wer_lang_en"]
     else:
         assert per_language_keys == []
+
+
+def test_online_po_cfg_rejects_removed_inference_cfg_prob():
+    # #16301 replaced inference_cfg_prob with rollout_cfg_mode; a recipe that still sets it must fail fast
+    # instead of silently training without CFG rollouts.
+    with pytest.raises(ValueError, match="rollout_cfg_mode"):
+        po_module._validate_online_po_cfg(OmegaConf.create({"inference_cfg_prob": 0.5}))
+
+
+@pytest.mark.parametrize("cfg", [{}, {"inference_cfg_prob": 0.0}])
+def test_online_po_cfg_accepts_zero_or_absent_inference_cfg_prob(cfg):
+    po_module._validate_online_po_cfg(OmegaConf.create(cfg))
+
+
+@pytest.mark.parametrize("backend", ["defualt", "whisper"])
+def test_online_po_cfg_rejects_unknown_validation_asr_backend(backend):
+    cfg = OmegaConf.create({"validation_asr_backend": backend, "run_val_inference": True})
+
+    with pytest.raises(ValueError, match="validation_asr_backend"):
+        po_module._validate_online_po_cfg(cfg)
+
+
+def test_online_po_cfg_rejects_default_validation_asr_backend_without_run_val_inference():
+    with pytest.raises(ValueError, match="run_val_inference"):
+        po_module._validate_online_po_cfg(OmegaConf.create({"validation_asr_backend": "default"}))
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [{"validation_asr_backend": "default", "run_val_inference": True}, {"validation_asr_backend": "reward"}, {}],
+)
+def test_online_po_cfg_accepts_supported_validation_asr_backends(cfg):
+    po_module._validate_online_po_cfg(OmegaConf.create(cfg))
+
+
+def test_online_po_cfg_rejects_unknown_rollout_cfg_mode():
+    with pytest.raises(ValueError, match="rollout_cfg_mode"):
+        po_module._validate_online_po_cfg(OmegaConf.create({"rollout_cfg_mode": "always"}))
+
+
+def test_po_init_validates_cfg_before_loading_any_model(monkeypatch):
+    def _base_init(self, cfg, trainer=None):
+        pytest.fail("the config must be validated before the base model is built")
+
+    monkeypatch.setattr(EasyMagpieTTSModel, "__init__", _base_init)
+
+    with pytest.raises(ValueError, match="inference_cfg_prob"):
+        EasyMagpieTTSModelOnlinePO(OmegaConf.create({"inference_cfg_prob": 0.5}))
+
+
+@pytest.mark.parametrize(
+    ("rollout_cfg_mode", "global_step", "expected"),
+    [("off", 0, False), ("off", 1, False), ("alternate", 0, False), ("alternate", 1, True), ("alternate", 2, False)],
+)
+def test_rollout_uses_cfg_only_on_odd_steps_in_alternate_mode(rollout_cfg_mode, global_step, expected):
+    model = _make_validation_asr_model(EasyMagpieTTSModelOnlinePO, {})
+    # LightningModule.global_step returns self.trainer.global_step once a trainer is attached via self._trainer.
+    model._trainer = SimpleNamespace(global_step=global_step)
+
+    assert model._rollout_uses_cfg(rollout_cfg_mode) is expected
+
+
+def test_po_reference_model_cfg_disables_validation_inference_and_utmos(monkeypatch):
+    cfg = OmegaConf.create(
+        {"run_val_inference": True, "use_utmos": True, "train_ds": {"dataset": {}}, "validation_ds": {"dataset": {}}}
+    )
+    received_cfgs = []
+
+    def _base_init(self, cfg, trainer=None):
+        received_cfgs.append(cfg)
+        if len(received_cfgs) == 1:
+            # The PO model's own super().__init__(): give it just enough state to reach the reference-model build.
+            torch.nn.Module.__init__(self)
+            self._cfg = cfg
+            return
+        raise _ReferenceModelConstructed
+
+    monkeypatch.setattr(EasyMagpieTTSModel, "__init__", _base_init)
+
+    with pytest.raises(_ReferenceModelConstructed):
+        EasyMagpieTTSModelOnlinePO(cfg)
+
+    assert len(received_cfgs) == 2
+    assert received_cfgs[0] is cfg
+    ref_model_cfg = received_cfgs[1]
+    assert ref_model_cfg is not cfg
+    assert ref_model_cfg.run_val_inference is False
+    assert ref_model_cfg.use_utmos is False
+    assert ref_model_cfg.train_ds is None
+    assert ref_model_cfg.validation_ds is None
+    # The policy model's own cfg keeps its validation settings.
+    assert cfg.run_val_inference is True
+    assert cfg.use_utmos is True
+
+
+def test_lhotse_dataloader_rejects_removed_challenging_text_replacement_prob():
+    # The key check runs before the multiturn dataset is built, so a bare model with only `_cfg` is enough.
+    model = _make_validation_asr_model(EasyMagpieTTSModel, {"use_multiturn_dataset": True})
+    dataset_cfg = OmegaConf.create({"dataset": {"challenging_text_replacement_prob": 0.3}})
+
+    with pytest.raises(ValueError, match="challenging_text_start_prob / challenging_text_end_prob"):
+        model.get_lhotse_dataloader(dataset_cfg, mode="train")
+
+
+def test_challenging_text_dataset_keys_check_accepts_schedule_keys():
+    dataset_cfg = OmegaConf.create(
+        {
+            "challenging_texts_path": "texts.txt",
+            "challenging_text_start_prob": 0.1,
+            "challenging_text_end_prob": 0.5,
+            "challenging_text_start_step": 100,
+            "challenging_text_end_step": 500,
+        }
+    )
+
+    easy_magpietts_module._check_challenging_text_dataset_keys(dataset_cfg)

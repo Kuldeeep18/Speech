@@ -50,7 +50,7 @@ TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 coverage run -a --data-file=/workspace/.cover
     ++model.aux_phoneme_loss_weight=0.1 \
     ++model.best_cer_threshold=1.0 \
     ++model.worst_cer_threshold=1.0 \
-    +model.inference_cfg_prob=0.5 \
+    +model.rollout_cfg_mode=alternate \
     +model.inference_cfg_scale=2.5 \
     +model.gt_phoneme_input_prob=1.0 \
     +model.inference_temperature=0.7 \
@@ -69,7 +69,7 @@ TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 coverage run -a --data-file=/workspace/.cover
     trainer.precision=32 \
     trainer.gradient_clip_val=0.0 \
     trainer.devices="[0]" \
-    +trainer.limit_train_batches=1 \
+    +trainer.limit_train_batches=2 \
     +trainer.limit_val_batches=1 \
     +trainer.val_check_interval=1 \
     trainer.strategy=auto \
