@@ -19,7 +19,13 @@ import pytest
 import torch
 
 from nemo.collections.tts.parts.utils import reward_asr
-from nemo.collections.tts.parts.utils.reward_asr import ProcessRewardASRBackend, RewardASRBackend, RewardASRRouter
+from nemo.collections.tts.parts.utils.reward_asr import (
+    NemoRewardASRBackend,
+    ProcessRewardASRBackend,
+    RewardASRBackend,
+    RewardASRRouter,
+    WhisperRewardASRBackend,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -203,3 +209,31 @@ def test_process_backend_pins_worker_to_physical_gpu(tmp_path, monkeypatch):
     ready_messages = [message for message in messages if "ASR worker ready" in message]
     assert len(ready_messages) == 1
     assert "CUDA_VISIBLE_DEVICES=3" in ready_messages[0]
+
+
+def test_router_backend_for_language_returns_routed_or_default_backend():
+    router = RewardASRRouter(
+        {
+            "default_backend": "qwen",
+            "language_routes": {"hi": "whisper"},
+            "backends": {
+                "qwen": {"type": "fake", "name": "qwen"},
+                "whisper": {"type": "fake", "name": "whisper"},
+            },
+        },
+        device_getter=lambda: torch.device("cpu"),
+        backend_types={"fake": FakeBackend},
+    )
+
+    assert router.backend_for_language("hi") is router.backends["whisper"]
+    assert router.backend_for_language("en") is router.backends["qwen"]
+    assert router.backend_for_language("de") is router.backends["qwen"]
+
+
+def test_only_whisper_reward_backend_normalizes_transcripts_by_default():
+    # Class attributes only: WhisperRewardASRBackend / NemoRewardASRBackend load a model in their constructors.
+    assert RewardASRBackend.normalizes_transcripts_by_default is False
+    assert WhisperRewardASRBackend.normalizes_transcripts_by_default is True
+    assert NemoRewardASRBackend.normalizes_transcripts_by_default is False
+    assert ProcessRewardASRBackend.normalizes_transcripts_by_default is False
+    assert FakeBackend.normalizes_transcripts_by_default is False

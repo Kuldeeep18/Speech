@@ -57,6 +57,11 @@ NEMOTRON_LANGUAGE_TAG_PATTERN = re.compile(r"\s*<[a-z]{2,3}(?:-[A-Za-z]{2,4})?>\
 class RewardASRBackend(abc.ABC):
     """Minimal interface for reward transcription implementations."""
 
+    #: Whether transcripts from this backend are text-normalized before CER/WER when the PO model config leaves
+    #: ``normalize_reward_transcript`` unset. Whisper emits written-form text (digits, punctuation, casing) that the
+    #: TTS normalizer maps onto the spoken-form reference text; the other backends keep their raw transcripts.
+    normalizes_transcripts_by_default: bool = False
+
     @abc.abstractmethod
     def transcribe(self, audio_paths: Sequence[str], languages: Sequence[str]) -> List[str]:
         """Return one transcript for each audio path."""
@@ -66,6 +71,10 @@ class RewardASRBackend(abc.ABC):
 
 
 class WhisperRewardASRBackend(RewardASRBackend):
+    """Hugging Face Whisper backend; its written-form transcripts are normalized by default."""
+
+    normalizes_transcripts_by_default = True
+
     def __init__(self, cfg: Mapping, device_getter: Callable[[], torch.device]):
         from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
@@ -376,6 +385,13 @@ class RewardASRRouter:
                 )
             self.backends[name] = backend_types[backend_type](backend_cfg, device_getter)
 
+    def _backend_name_for_language(self, language: str) -> str:
+        return self.language_routes.get(language, self.default_backend)
+
+    def backend_for_language(self, language: str) -> RewardASRBackend:
+        """Return the backend that :meth:`transcribe` uses for ``language``: its route or the default backend."""
+        return self.backends[self._backend_name_for_language(language)]
+
     def transcribe(self, audio_paths: Sequence[str], languages: Sequence[str]) -> List[str]:
         if len(audio_paths) != len(languages):
             raise ValueError(
@@ -384,7 +400,7 @@ class RewardASRRouter:
         transcripts = [""] * len(audio_paths)
         grouped: Dict[str, List[tuple[int, str, str]]] = {}
         for index, (audio_path, language) in enumerate(zip(audio_paths, languages)):
-            backend_name = self.language_routes.get(language, self.default_backend)
+            backend_name = self._backend_name_for_language(language)
             grouped.setdefault(backend_name, []).append((index, audio_path, language))
 
         for backend_name, items in grouped.items():

@@ -68,6 +68,11 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         ``inference_cfg_prob`` or an unknown ``validation_asr_backend`` fail before any model is loaded. The frozen
         reference model is built from a copy of ``cfg`` with ``run_val_inference`` and ``use_utmos`` disabled: it
         only provides teacher-forced logits and must not load evaluation models of its own.
+
+        The reward ASR router is built from ``cfg.reward_asr``; when that key is absent, the flat legacy keys
+        (``reward_asr_model`` and friends) are translated by ``_translate_legacy_reward_asr_cfg``. Whether a reward
+        transcript is text-normalized before CER/WER is decided per backend; see
+        ``_should_normalize_reward_transcript``.
         """
         _validate_online_po_cfg(cfg)
         super().__init__(cfg, trainer)
@@ -97,63 +102,7 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
 
         reward_asr_cfg = cfg.get('reward_asr')
         if reward_asr_cfg is None:
-            # Backward-compatible translation for existing recipes. New recipes
-            # should use reward_asr.default_backend and language_routes directly.
-            legacy_backend = str(cfg.get("reward_asr_model", "nemo"))
-            model_name = cfg.get("reward_asr_model_name", "nvidia/parakeet-ctc-0.6b")
-            if legacy_backend in {"nemo", "nemotron"}:
-                backend_type = "nemo_process" if legacy_backend == "nemotron" else "nemo"
-                reward_asr_cfg = {
-                    "default_backend": legacy_backend,
-                    "language_routes": {},
-                    "log_samples": cfg.get("reward_asr_log_samples", 0),
-                    "backends": {
-                        legacy_backend: {
-                            "type": backend_type,
-                            "model_name": model_name,
-                            "batch_size": cfg.get("reward_asr_batch_size", 16),
-                            "attention_context": cfg.get("reward_asr_att_context_size"),
-                        }
-                    },
-                }
-            elif legacy_backend == "whisper":
-                reward_asr_cfg = {
-                    "default_backend": "whisper",
-                    "language_routes": {},
-                    "log_samples": cfg.get("reward_asr_log_samples", 0),
-                    "backends": {
-                        "whisper": {
-                            "type": "whisper",
-                            "model_name": "openai/whisper-large-v3",
-                        }
-                    },
-                }
-            elif legacy_backend == "qwen_whisper":
-                whisper_languages = list(cfg.get("qwen_asr_whisper_languages", ["hi"]))
-                qwen_cfg = {
-                    "type": "qwen",
-                    "model_name": cfg.get("qwen_asr_model_name", "Qwen/Qwen3-ASR-0.6B"),
-                    "batch_size": cfg.get("qwen_asr_batch_size", 4),
-                    "max_new_tokens": cfg.get("qwen_asr_max_new_tokens", 256),
-                }
-                if cfg.get("qwen_asr_python") is not None:
-                    qwen_cfg["python_executable"] = cfg.qwen_asr_python
-                reward_asr_cfg = {
-                    "default_backend": "qwen",
-                    "language_routes": {language: "whisper" for language in whisper_languages},
-                    "log_samples": cfg.get("reward_asr_log_samples", 0),
-                    "backends": {
-                        "qwen": qwen_cfg,
-                        "whisper": {
-                            "type": "whisper",
-                            "model_name": "openai/whisper-large-v3",
-                        },
-                    },
-                }
-            else:
-                raise ValueError(
-                    f"Unknown legacy reward_asr_model={legacy_backend!r}; configure model.reward_asr instead"
-                )
+            reward_asr_cfg = _translate_legacy_reward_asr_cfg(cfg)
         self._reward_asr_router = RewardASRRouter(reward_asr_cfg, device_getter=lambda: self.device)
         self.reward_asr_log_samples = max(int(reward_asr_cfg.get("log_samples", 0)), 0)
 
@@ -229,11 +178,9 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
                     "changes sampled actions without a corresponding policy likelihood."
                 )
 
-        self._normalize_reward_transcript = self.cfg.get(
-            'normalize_reward_transcript', self.cfg.get('normalize_whisper_transcript', True)
-        )
-        if self._normalize_reward_transcript:
-            self._normalizer_cache = {}
+        # Normalization of reward transcripts is decided per backend (see _should_normalize_reward_transcript); the
+        # per-language normalizers are created lazily by _get_cached_normalizer.
+        self._normalizer_cache = {}
 
         # Entropy bonus coefficient – encourages exploration and prevents mode collapse.
         # Set to 0.0 to disable. Typical range: 0.001–0.01.
@@ -718,14 +665,38 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
             f"prompt: {prompt_text}\n{table}\n"
         )
 
+    def _should_normalize_reward_transcript(self, language: str) -> bool:
+        """Return whether reward transcripts for ``language`` are text-normalized before CER/WER.
+
+        ``cfg.normalize_reward_transcript`` applies to every reward ASR backend when it is set (``True`` or
+        ``False``). When it is unset, a transcript is normalized only if the backend that produced it declares
+        ``normalizes_transcripts_by_default`` (Whisper) and the legacy ``cfg.normalize_whisper_transcript``
+        (default ``True``) is not false, matching the pre-router behaviour of normalizing Whisper output only.
+        """
+        normalize = self.cfg.get('normalize_reward_transcript')
+        if normalize is not None:
+            return bool(normalize)
+        if not self.cfg.get('normalize_whisper_transcript', True):
+            return False
+        return bool(self._reward_asr_router.backend_for_language(language).normalizes_transcripts_by_default)
+
     def _compute_pred_transcripts(self, predicted_audio_paths: List[str], batch_repeated: Dict) -> List[str]:
-        """Route reward transcription by language, then normalize consistently for CER/WER."""
+        """Transcribe generated audio through the language-routed reward ASR and prepare it for CER/WER.
+
+        A transcript is text-normalized (``_get_cached_normalizer``) only when
+        ``_should_normalize_reward_transcript`` allows it for its language: Whisper transcripts by default, all or
+        none when ``cfg.normalize_reward_transcript`` is set. ``process_text_for_cer`` is applied to every
+        transcript afterwards, and up to ``reward_asr_log_samples`` raw/normalized pairs per language are logged on
+        the global-zero rank.
+        """
         languages = list(batch_repeated.get('languages', ['en'] * len(predicted_audio_paths)))
         raw_transcripts = self._reward_asr_router.transcribe(predicted_audio_paths, languages)
         pred_transcripts = []
         logged_languages: Dict[str, int] = {}
         for item_idx, (language, transcript) in enumerate(zip(languages, raw_transcripts)):
-            normalizer = self._get_cached_normalizer(language) if self._normalize_reward_transcript else None
+            normalizer = (
+                self._get_cached_normalizer(language) if self._should_normalize_reward_transcript(language) else None
+            )
             normalized = normalizer.normalize(transcript) if normalizer is not None else transcript
             pred_transcripts.append(process_text_for_cer(normalized))
 
@@ -1684,3 +1655,81 @@ def _validate_online_po_cfg(cfg: DictConfig) -> None:
                 "validation_asr_backend='default' requires run_val_inference=true: the base-class validation ASR "
                 "models are loaded only when run_val_inference is true."
             )
+
+
+def _translate_legacy_reward_asr_cfg(cfg: DictConfig) -> dict:
+    """Translate the flat legacy reward-ASR keys of an online-PO config into a ``model.reward_asr`` dict.
+
+    ``EasyMagpieTTSModelOnlinePO.__init__`` calls this only when ``cfg.reward_asr`` is absent, so existing recipes
+    keep working. New recipes should configure ``model.reward_asr`` (``default_backend``, ``language_routes``,
+    ``backends`` and ``log_samples``) directly; see ``RewardASRRouter``.
+
+    Accepted legacy keys:
+
+    * ``reward_asr_model`` (default ``'nemo'``): ``'nemo'`` (in-process NeMo ASR), ``'nemotron'`` (NeMo ASR in a
+      worker process, backend type ``nemo_process``), ``'whisper'`` (``openai/whisper-large-v3``) or
+      ``'qwen_whisper'`` (Qwen ASR worker, with Whisper for the ``qwen_asr_whisper_languages``).
+    * ``reward_asr_model_name`` (``nemo`` / ``nemotron``): forwarded as the backend ``model_name`` only when it is
+      set, so each backend otherwise applies its own default: ``nvidia/parakeet-ctc-0.6b`` for ``nemo`` and
+      ``nvidia/nemotron-3.5-asr-streaming-0.6b`` for ``nemotron``.
+    * ``reward_asr_batch_size`` (default 16) and ``reward_asr_att_context_size`` (``nemo`` / ``nemotron``):
+      forwarded as ``batch_size`` and ``attention_context``. The in-process ``nemo`` backend transcribes each
+      rollout batch at once and does not read ``batch_size``; the ``nemotron`` worker uses it to split requests
+      for prompted models (such as its default model) and transcribes non-prompted models at once.
+    * ``reward_asr_log_samples`` (default 0): forwarded as ``log_samples``.
+    * ``qwen_asr_whisper_languages`` (default ``['hi']``), ``qwen_asr_model_name`` (default
+      ``Qwen/Qwen3-ASR-0.6B``), ``qwen_asr_batch_size`` (default 4), ``qwen_asr_max_new_tokens`` (default 256) and
+      ``qwen_asr_python`` (``qwen_whisper`` only): configure the Qwen worker and the Whisper language routes.
+
+    Returns:
+        A plain dict accepted by ``RewardASRRouter``.
+
+    Raises:
+        ValueError: If ``reward_asr_model`` is not one of the values listed above.
+    """
+    legacy_backend = str(cfg.get("reward_asr_model", "nemo"))
+    log_samples = cfg.get("reward_asr_log_samples", 0)
+    if legacy_backend in {"nemo", "nemotron"}:
+        backend_cfg = {
+            "type": "nemo_process" if legacy_backend == "nemotron" else "nemo",
+            "batch_size": cfg.get("reward_asr_batch_size", 16),
+            "attention_context": cfg.get("reward_asr_att_context_size"),
+        }
+        model_name = cfg.get("reward_asr_model_name")
+        if model_name is not None:
+            # Only an explicit name overrides the backend default: forwarding the parakeet default unconditionally
+            # made reward_asr_model=nemotron score every language with the English CTC model.
+            backend_cfg["model_name"] = model_name
+        return {
+            "default_backend": legacy_backend,
+            "language_routes": {},
+            "log_samples": log_samples,
+            "backends": {legacy_backend: backend_cfg},
+        }
+    if legacy_backend == "whisper":
+        return {
+            "default_backend": "whisper",
+            "language_routes": {},
+            "log_samples": log_samples,
+            "backends": {"whisper": {"type": "whisper", "model_name": "openai/whisper-large-v3"}},
+        }
+    if legacy_backend == "qwen_whisper":
+        whisper_languages = list(cfg.get("qwen_asr_whisper_languages", ["hi"]))
+        qwen_cfg = {
+            "type": "qwen",
+            "model_name": cfg.get("qwen_asr_model_name", "Qwen/Qwen3-ASR-0.6B"),
+            "batch_size": cfg.get("qwen_asr_batch_size", 4),
+            "max_new_tokens": cfg.get("qwen_asr_max_new_tokens", 256),
+        }
+        if cfg.get("qwen_asr_python") is not None:
+            qwen_cfg["python_executable"] = cfg.qwen_asr_python
+        return {
+            "default_backend": "qwen",
+            "language_routes": {language: "whisper" for language in whisper_languages},
+            "log_samples": log_samples,
+            "backends": {
+                "qwen": qwen_cfg,
+                "whisper": {"type": "whisper", "model_name": "openai/whisper-large-v3"},
+            },
+        }
+    raise ValueError(f"Unknown legacy reward_asr_model={legacy_backend!r}; configure model.reward_asr instead")

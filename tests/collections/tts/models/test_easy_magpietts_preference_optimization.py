@@ -25,6 +25,7 @@ from nemo.collections.tts.models.easy_magpietts import EasyMagpieTTSModel
 from nemo.collections.tts.models.easy_magpietts_preference_optimization import EasyMagpieTTSModelOnlinePO
 from nemo.collections.tts.modules.magpietts_modules import LocalTransformerType
 from nemo.collections.tts.parts.utils.helpers import process_text_for_cer
+from nemo.collections.tts.parts.utils.reward_asr import ProcessRewardASRBackend
 
 
 pytestmark = pytest.mark.unit
@@ -91,6 +92,82 @@ def _make_validation_epoch_end_model(model_cls, cfg, use_multilingual_asr):
 
     model.log = _log
     return model, logged
+
+
+class _FakeRewardASRRouter:
+    """Reward ASR router stand-in: ``hi`` goes to a Whisper-like backend, every other language to a NeMo-like one.
+
+    ``transcribe`` returns ``"raw <language>"`` for each item; the fake backends only carry the per-backend
+    ``normalizes_transcripts_by_default`` flag that ``RewardASRBackend`` subclasses declare.
+    """
+
+    def __init__(self):
+        self.backends = {
+            "whisper": SimpleNamespace(normalizes_transcripts_by_default=True),
+            "nemo": SimpleNamespace(normalizes_transcripts_by_default=False),
+        }
+
+    def backend_for_language(self, language):
+        return self.backends["whisper" if language == "hi" else "nemo"]
+
+    def transcribe(self, audio_paths, languages):
+        return [f"raw {language}" for language in languages]
+
+
+def _install_fake_normalizer(model):
+    """Make ``model._get_cached_normalizer`` return a normalizer that appends ``" normalized"``.
+
+    Returns the list of languages for which a normalizer was requested, in call order.
+    """
+    normalized_languages = []
+
+    def _get_cached_normalizer(language):
+        normalized_languages.append(language)
+        return SimpleNamespace(normalize=lambda text: f"{text} normalized")
+
+    model._get_cached_normalizer = _get_cached_normalizer
+    return normalized_languages
+
+
+def _make_reward_transcript_model(cfg):
+    """Bare PO model whose reward ASR is a ``_FakeRewardASRRouter`` and whose normalizer appends ``" normalized"``.
+
+    Returns the model and the list of languages for which ``_get_cached_normalizer`` was requested.
+    """
+    model = _make_validation_asr_model(EasyMagpieTTSModelOnlinePO, cfg)
+    model._reward_asr_router = _FakeRewardASRRouter()
+    model.reward_asr_log_samples = 0
+    return model, _install_fake_normalizer(model)
+
+
+def _init_po_model_with_fake_reward_asr(monkeypatch, cfg):
+    """Run the real ``EasyMagpieTTSModelOnlinePO.__init__`` on ``cfg`` with every model load stubbed out.
+
+    The base ``EasyMagpieTTSModel.__init__`` only records ``cfg`` and the attributes the PO ``__init__`` reads, the
+    reward ASR router is a ``_FakeRewardASRRouter`` and the speaker-verification model is a stub. Returns the model
+    and the list of reward ASR configs handed to the router.
+    """
+
+    def _base_init(self, cfg, trainer=None):
+        torch.nn.Module.__init__(self)
+        self._cfg = cfg
+        self._trainer = trainer
+        self.num_all_tokens_per_codebook = 2048
+
+    monkeypatch.setattr(EasyMagpieTTSModel, "__init__", _base_init)
+    router_cfgs = []
+
+    def _fake_router(reward_asr_cfg, device_getter):
+        router_cfgs.append(reward_asr_cfg)
+        return _FakeRewardASRRouter()
+
+    monkeypatch.setattr(po_module, "RewardASRRouter", _fake_router)
+    monkeypatch.setattr(
+        po_module.nemo_asr.models.EncDecSpeakerLabelModel,
+        "from_pretrained",
+        lambda model_name: SimpleNamespace(freeze=lambda: None),
+    )
+    return EasyMagpieTTSModelOnlinePO(cfg), router_cfgs
 
 
 def test_action_po_uses_exact_forward_kl():
@@ -367,3 +444,205 @@ def test_challenging_text_dataset_keys_check_accepts_schedule_keys():
     )
 
     easy_magpietts_module._check_challenging_text_dataset_keys(dataset_cfg)
+
+
+_LEGACY_NEMO_KEYS = {"reward_asr_batch_size": 8, "reward_asr_att_context_size": [70, 1], "reward_asr_log_samples": 2}
+_WHISPER_BACKEND_CFG = {"type": "whisper", "model_name": "openai/whisper-large-v3"}
+
+
+@pytest.mark.parametrize(
+    ("legacy_cfg", "expected"),
+    [
+        pytest.param(
+            {},
+            {
+                "default_backend": "nemo",
+                "language_routes": {},
+                "log_samples": 0,
+                "backends": {"nemo": {"type": "nemo", "batch_size": 16, "attention_context": None}},
+            },
+            id="defaults",
+        ),
+        pytest.param(
+            {"reward_asr_model": "nemo", **_LEGACY_NEMO_KEYS},
+            {
+                "default_backend": "nemo",
+                "language_routes": {},
+                "log_samples": 2,
+                "backends": {"nemo": {"type": "nemo", "batch_size": 8, "attention_context": [70, 1]}},
+            },
+            id="nemo",
+        ),
+        pytest.param(
+            {"reward_asr_model": "nemotron", **_LEGACY_NEMO_KEYS},
+            {
+                "default_backend": "nemotron",
+                "language_routes": {},
+                "log_samples": 2,
+                "backends": {"nemotron": {"type": "nemo_process", "batch_size": 8, "attention_context": [70, 1]}},
+            },
+            id="nemotron",
+        ),
+        pytest.param(
+            {"reward_asr_model": "whisper", "reward_asr_log_samples": 1},
+            {
+                "default_backend": "whisper",
+                "language_routes": {},
+                "log_samples": 1,
+                "backends": {"whisper": _WHISPER_BACKEND_CFG},
+            },
+            id="whisper",
+        ),
+        pytest.param(
+            {"reward_asr_model": "qwen_whisper"},
+            {
+                "default_backend": "qwen",
+                "language_routes": {"hi": "whisper"},
+                "log_samples": 0,
+                "backends": {
+                    "qwen": {
+                        "type": "qwen",
+                        "model_name": "Qwen/Qwen3-ASR-0.6B",
+                        "batch_size": 4,
+                        "max_new_tokens": 256,
+                    },
+                    "whisper": _WHISPER_BACKEND_CFG,
+                },
+            },
+            id="qwen_whisper-defaults",
+        ),
+        pytest.param(
+            {
+                "reward_asr_model": "qwen_whisper",
+                "qwen_asr_whisper_languages": ["hi", "ta"],
+                "qwen_asr_model_name": "Qwen/Qwen3-ASR-1.7B",
+                "qwen_asr_batch_size": 2,
+                "qwen_asr_max_new_tokens": 64,
+                "qwen_asr_python": "/opt/qwen_asr/bin/python",
+                "reward_asr_log_samples": 3,
+            },
+            {
+                "default_backend": "qwen",
+                "language_routes": {"hi": "whisper", "ta": "whisper"},
+                "log_samples": 3,
+                "backends": {
+                    "qwen": {
+                        "type": "qwen",
+                        "model_name": "Qwen/Qwen3-ASR-1.7B",
+                        "batch_size": 2,
+                        "max_new_tokens": 64,
+                        "python_executable": "/opt/qwen_asr/bin/python",
+                    },
+                    "whisper": _WHISPER_BACKEND_CFG,
+                },
+            },
+            id="qwen_whisper-overrides",
+        ),
+    ],
+)
+def test_legacy_reward_asr_cfg_translation(legacy_cfg, expected):
+    # Without reward_asr_model_name the nemo / nemotron backend configs must not carry a model_name at all, so each
+    # backend applies its own default (parakeet-ctc-0.6b in-process, nemotron-3.5-asr-streaming-0.6b in the worker).
+    translated = po_module._translate_legacy_reward_asr_cfg(OmegaConf.create(legacy_cfg))
+
+    # Values read from the DictConfig may still be OmegaConf containers; compare as plain Python.
+    assert OmegaConf.to_container(OmegaConf.create(translated)) == expected
+
+
+@pytest.mark.parametrize(("reward_asr_model", "backend_type"), [("nemo", "nemo"), ("nemotron", "nemo_process")])
+def test_legacy_reward_asr_model_name_is_forwarded_when_set(reward_asr_model, backend_type):
+    cfg = OmegaConf.create({"reward_asr_model": reward_asr_model, "reward_asr_model_name": "nvidia/custom-asr.nemo"})
+
+    translated = po_module._translate_legacy_reward_asr_cfg(cfg)
+
+    assert translated["backends"][reward_asr_model] == {
+        "type": backend_type,
+        "model_name": "nvidia/custom-asr.nemo",
+        "batch_size": 16,
+        "attention_context": None,
+    }
+
+
+def test_legacy_reward_asr_cfg_rejects_unknown_model():
+    with pytest.raises(ValueError, match="Unknown legacy reward_asr_model='canary'; configure model.reward_asr"):
+        po_module._translate_legacy_reward_asr_cfg(OmegaConf.create({"reward_asr_model": "canary"}))
+
+
+def test_legacy_nemotron_reward_asr_uses_the_worker_default_model():
+    # Before the fix the translation always forwarded the parakeet default, so reward_asr_model=nemotron scored
+    # multilingual audio with the English nvidia/parakeet-ctc-0.6b model in the worker's non-prompted path.
+    translated = po_module._translate_legacy_reward_asr_cfg(OmegaConf.create({"reward_asr_model": "nemotron"}))
+
+    # ProcessRewardASRBackend only records its settings here; the worker process starts on the first transcribe().
+    # NemoRewardASRBackend is deliberately not built: it downloads and loads an ASR model in its constructor.
+    backend = ProcessRewardASRBackend(translated["backends"]["nemotron"], device_getter=lambda: torch.device("cpu"))
+
+    assert backend.worker_backend == "nemo"
+    assert backend.model_name == "nvidia/nemotron-3.5-asr-streaming-0.6b"
+    assert backend.process is None
+
+
+@pytest.mark.parametrize("cfg", [{"reward_asr_model": "nemotron"}, {"reward_asr": {"default_backend": "x"}}])
+def test_po_init_builds_reward_asr_router_from_reward_asr_or_translated_legacy_keys(monkeypatch, cfg):
+    cfg = OmegaConf.create({"reference_free": True, **cfg})
+
+    model, router_cfgs = _init_po_model_with_fake_reward_asr(monkeypatch, cfg)
+
+    assert len(router_cfgs) == 1
+    assert isinstance(model._reward_asr_router, _FakeRewardASRRouter)
+    if "reward_asr" in cfg:
+        assert router_cfgs[0] is cfg.reward_asr
+    else:
+        # The translated legacy config reaches the router without a model_name, so the nemotron worker applies its
+        # own default instead of the English parakeet CTC model the translation used to forward unconditionally.
+        assert router_cfgs[0]["default_backend"] == "nemotron"
+        nemotron_cfg = router_cfgs[0]["backends"]["nemotron"]
+        assert nemotron_cfg["type"] == "nemo_process"
+        backend = ProcessRewardASRBackend(nemotron_cfg, device_getter=lambda: torch.device("cpu"))
+        assert backend.model_name == "nvidia/nemotron-3.5-asr-streaming-0.6b"
+        assert "model_name" not in nemotron_cfg
+
+
+@pytest.mark.parametrize(
+    ("cfg", "expected_normalized_languages"),
+    [
+        pytest.param({}, ["hi"], id="unset-normalizes-whisper-only"),
+        pytest.param({"normalize_reward_transcript": True}, ["hi", "en"], id="explicit-true-normalizes-every-backend"),
+        pytest.param({"normalize_reward_transcript": False}, [], id="explicit-false-normalizes-nothing"),
+        pytest.param({"normalize_whisper_transcript": False}, [], id="legacy-false-disables-whisper"),
+        pytest.param(
+            {"normalize_whisper_transcript": False, "normalize_reward_transcript": True},
+            ["hi", "en"],
+            id="explicit-true-overrides-legacy-false",
+        ),
+    ],
+)
+def test_reward_transcripts_are_normalized_per_backend_unless_configured(cfg, expected_normalized_languages):
+    # "hi" is routed to the Whisper-like backend (normalizes by default), "en" to the NeMo-like one (does not).
+    # Before the fix every backend was normalized whenever the keys were unset, changing the default reward and
+    # validation CER of reward_asr_model=nemo recipes.
+    model, normalized_languages = _make_reward_transcript_model(cfg)
+    languages = ["hi", "en"]
+
+    transcripts = model._compute_pred_transcripts(["a.wav", "b.wav"], {"languages": languages, "raw_texts": ["", ""]})
+
+    assert normalized_languages == expected_normalized_languages
+    expected_transcripts = []
+    for language in languages:
+        suffix = " normalized" if language in expected_normalized_languages else ""
+        expected_transcripts.append(process_text_for_cer(f"raw {language}{suffix}"))
+    assert transcripts == expected_transcripts
+
+
+def test_po_init_normalizes_only_whisper_reward_transcripts_when_keys_are_unset(monkeypatch):
+    # Same scaffold as the router wiring test, but here _compute_pred_transcripts consults the state the real
+    # __init__ leaves behind. Before the fix __init__ resolved one flag (default True) that normalized the transcripts
+    # of every backend; with both keys unset only the Whisper-like "hi" transcript may be normalized.
+    model, _ = _init_po_model_with_fake_reward_asr(monkeypatch, OmegaConf.create({"reference_free": True}))
+    normalized_languages = _install_fake_normalizer(model)
+    languages = ["hi", "en"]
+
+    transcripts = model._compute_pred_transcripts(["a.wav", "b.wav"], {"languages": languages, "raw_texts": ["", ""]})
+
+    assert normalized_languages == ["hi"]
+    assert transcripts == [process_text_for_cer("raw hi normalized"), process_text_for_cer("raw en")]
