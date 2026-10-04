@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
+import json
 import sys
 import textwrap
+from pathlib import Path
 
 import pytest
 import torch
@@ -237,3 +240,66 @@ def test_only_whisper_reward_backend_normalizes_transcripts_by_default():
     assert NemoRewardASRBackend.normalizes_transcripts_by_default is False
     assert ProcessRewardASRBackend.normalizes_transcripts_by_default is False
     assert FakeBackend.normalizes_transcripts_by_default is False
+
+
+def _load_reward_asr_worker_module():
+    """Import ``scripts/tts/reward_asr_worker.py`` from the path ``ProcessRewardASRBackend`` launches by default."""
+    worker_path = Path(reward_asr.__file__).resolve().parents[5] / "scripts" / "tts" / "reward_asr_worker.py"
+    spec = importlib.util.spec_from_file_location("reward_asr_worker", worker_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_reward_asr_worker_parser_documents_and_accepts_the_backend_argv(tmp_path):
+    parser = _load_reward_asr_worker_module().build_arg_parser()
+
+    help_text = parser.format_help()
+    for flag in ("--backend", "--model", "--device", "--batch-size", "--max-new-tokens", "--language-map"):
+        assert flag in help_text
+
+    # Capture the argv that ProcessRewardASRBackend._start really builds instead of hard-coding its shape.
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        textwrap.dedent(
+            """
+            import json
+            import sys
+
+            print(json.dumps({"status": "ready"}), flush=True)
+            for line in sys.stdin:
+                request = json.loads(line)
+                if request["command"] == "shutdown":
+                    print(json.dumps({"status": "stopped"}), flush=True)
+                    break
+                print(json.dumps({"status": "ok", "transcripts": [json.dumps(sys.argv[1:])]}), flush=True)
+            """
+        )
+    )
+    backend = ProcessRewardASRBackend(
+        {
+            "type": "nemo_process",
+            "python_executable": sys.executable,
+            "worker_script": str(worker),
+            "model_name": "m.nemo",
+            "batch_size": 2,
+            "max_new_tokens": 8,
+            "language_map": {"en": "en-US"},
+            "timeout_seconds": 10,
+        },
+        device_getter=lambda: torch.device("cpu"),
+    )
+    try:
+        (argv_json,) = backend.transcribe(["a.wav"], ["en"])
+    finally:
+        backend.close()
+
+    args = parser.parse_args(json.loads(argv_json))
+    assert (args.backend, args.model, args.device, args.batch_size, args.max_new_tokens) == (
+        "nemo",
+        "m.nemo",
+        "cuda:0",
+        2,
+        8,
+    )
+    assert args.language_map == {"en": "en-US"}

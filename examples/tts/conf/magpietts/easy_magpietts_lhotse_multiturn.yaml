@@ -123,6 +123,18 @@ model:
       seed: 42
       shard_seed: "trng"
 
+      # Challenging-text replacement of the multi-turn dataset (training batches only; needs
+      # model.use_multiturn_dataset=true). The replacement probability grows linearly from
+      # challenging_text_start_prob at challenging_text_start_step to challenging_text_end_prob at
+      # challenging_text_end_step; only the online-PO model (EasyMagpieTTSModelOnlinePO) advances the step.
+      # For a constant probability p: start_prob=end_prob=p, start_step=0, end_step=1.
+      # challenging_texts_path: null  # UTF-8 file, one challenging text per line; required when end_prob > 0.
+      # challenging_text_start_prob: 0.0  # Probability at challenging_text_start_step (0 <= start <= end <= 1).
+      # challenging_text_end_prob: 0.0  # Probability reached at challenging_text_end_step and kept; 0 disables.
+      # challenging_text_start_step: 0  # Training step at which the probability starts growing (0 before it).
+      # challenging_text_end_step: 0  # Training step at which end_prob is reached; must be > start_step if enabled.
+      # context_audio_shuffle_batch_prob: 0.0  # Probability of shuffling valid audio contexts across a training batch.
+
       sampler_fusion: randomized_round_robin
       sampler_weights:
         tts_data: 0.5

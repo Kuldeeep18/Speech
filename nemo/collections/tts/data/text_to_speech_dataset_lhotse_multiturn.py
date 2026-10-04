@@ -270,9 +270,24 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
         return num_audio_samples
 
     def set_training_step(self, step: int) -> None:
+        """Advance the challenging-text schedule to global training ``step`` (negative values are clamped to 0).
+
+        The step lives in a shared ``multiprocessing.Value`` that DataLoader worker processes inherit, so the
+        trainer process can move the schedule forward without recreating the dataloader.
+        ``EasyMagpieTTSModelOnlinePO.training_step`` calls this with ``global_step`` before every rollout; other
+        training modes never call it and leave the step at 0.
+        """
         self._training_step.value = max(int(step), 0)
 
     def get_challenging_text_replacement_prob(self, step: int = None) -> float:
+        """Return the challenging-text replacement probability at ``step`` (default: the stored training step).
+
+        The probability is 0 before ``challenging_text_start_step``, grows linearly from
+        ``challenging_text_start_prob`` at ``challenging_text_start_step`` to ``challenging_text_end_prob`` at
+        ``challenging_text_end_step``, and stays at ``challenging_text_end_prob`` afterwards. With the defaults
+        (``challenging_text_end_step=0`` and ``challenging_text_end_prob=0.0``) every step returns 0.0, i.e. the
+        replacement is disabled.
+        """
         step = self._training_step.value if step is None else int(step)
         if step < self.challenging_text_start_step:
             return 0.0

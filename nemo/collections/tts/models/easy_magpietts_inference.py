@@ -314,9 +314,11 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         if self.text_conditioning_tokenizer_name is None:
             self.text_conditioning_tokenizer_name = list(cfg.text_tokenizers.keys())[0]
 
-        # Codec decoding has large temporary convolution activations. Decode generated
-        # waveforms in smaller sub-batches when requested, without changing generation
-        # or the returned codes/audio.
+        # Codec decoding has large temporary convolution activations. `codec_decode_batch_size` (default 0) makes
+        # `streaming_finalize` decode generated waveforms in sub-batches of that many items; 0, or a value not
+        # smaller than the batch, decodes the whole batch at once. Generation and the returned codes/audio are
+        # identical either way; only the codec decoder's peak memory changes. Online PO rollouts decode
+        # batch_size * n_generations_per_item items at a time, which is where this matters most.
         self.codec_decode_batch_size = max(int(cfg.get('codec_decode_batch_size', 0)), 0)
 
         self.cfg_unconditional_prob = cfg.get('cfg_unconditional_prob', 0.0)
@@ -2416,6 +2418,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             predicted_codes, predicted_codes_lens = self._prepare_codes_for_decode(
                 predicted_codes, predicted_codes_lens
             )
+            # `codec_decode_batch_size` from the model config: 0 (default) or >= batch_size decodes at once.
             decode_batch_size = self.codec_decode_batch_size
             if decode_batch_size <= 0 or decode_batch_size >= batch_size:
                 audio, audio_len, _ = self._codec_helper.codes_to_audio(

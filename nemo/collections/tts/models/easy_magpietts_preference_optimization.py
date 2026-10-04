@@ -1497,6 +1497,13 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         }
 
     def _update_dataset_training_step(self) -> None:
+        """Push ``global_step`` into the training dataset's challenging-text schedule, if it has one.
+
+        Starting from ``self._train_dl.dataset``, this follows nested ``.dataset`` attributes (Lhotse's iterable
+        wrapper, ``FallbackDataset``) and calls ``set_training_step(global_step)`` on the first object that
+        provides it, i.e. ``MagpieTTSLhotseMultiturnDataset``. ``training_step`` calls this before every rollout;
+        dataloaders without such a dataset are left untouched.
+        """
         dataset = getattr(getattr(self, "_train_dl", None), "dataset", None)
         while dataset is not None:
             if hasattr(dataset, "set_training_step"):
@@ -1619,6 +1626,7 @@ class EasyMagpieTTSModelOnlinePO(EasyMagpieTTSModel):
         self.log('train_teacher_forced_time_sec', teacher_forced_time_sec, prog_bar=False, sync_dist=True)
 
     def teardown(self, stage: str) -> None:
+        """Close the reward ASR router, which stops any reward ASR worker processes, then run the base teardown."""
         self._reward_asr_router.close()
         super().teardown(stage)
 

@@ -13,7 +13,37 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Persistent JSON-lines worker for process-isolated reward ASR backends."""
+"""Persistent JSON-lines worker for process-isolated reward ASR backends.
+
+``nemo.collections.tts.parts.utils.reward_asr.ProcessRewardASRBackend`` (reward ASR config ``type: nemo_process``
+or ``type: qwen``) launches this script in a separate Python process so that the reward ASR model never shares
+the CUDA context of the TTS model being trained. The parent passes every flag explicitly::
+
+    python scripts/tts/reward_asr_worker.py --backend {nemo,qwen} --model <name-or-path> --device cuda:0 \\
+        --batch-size 4 --max-new-tokens 256 --language-map '{"en": "en-US", ...}'
+
+Protocol (one JSON object per line; stdout carries protocol messages only, everything the model or its libraries
+print is redirected to stderr, which the parent appends to a log file):
+
+* After the model is loaded the worker writes
+  ``{"status": "ready", "backend": <backend>, "model": <model>, "device": <device>}``.
+* Each request line ``{"command": "transcribe", "audio_paths": [...], "languages": [...],
+  "attention_context": [left, right] | null}`` read from stdin is answered with
+  ``{"status": "ok", "transcripts": [...]}`` (one transcript per audio path, in order) or with
+  ``{"status": "error", "error": "<repr of the exception>"}``; the worker keeps serving after an error.
+* ``{"command": "shutdown"}`` is answered with ``{"status": "stopped"}`` and the worker exits.
+
+Backends:
+
+* ``qwen``: ``qwen_asr.Qwen3ASRModel`` (bfloat16, ``max_inference_batch_size=--batch-size``,
+  ``max_new_tokens=--max-new-tokens``). Request language codes are mapped to language names through
+  ``QWEN_LANGUAGE_MAP``; ``--language-map`` and ``attention_context`` are ignored.
+* ``nemo``: a ``nemo.collections.asr`` model, loaded with ``restore_from`` for ``.nemo`` paths and
+  ``from_pretrained`` otherwise. Prompted models (``EncDecHybridRNNTCTCBPEModelWithPrompt`` /
+  ``EncDecRNNTBPEModelWithPrompt``) are transcribed per language in chunks of ``--batch-size`` with
+  ``target_lang`` taken from ``--language-map`` and ``<lang>`` tags stripped; other models transcribe each request
+  at once. A non-null ``attention_context`` is applied with ``model.encoder.set_default_att_context_size``.
+"""
 
 import argparse
 import contextlib
@@ -129,15 +159,61 @@ def load_nemo(args, language_map):
     return transcribe
 
 
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser; ``ProcessRewardASRBackend._start`` passes every one of these flags explicitly."""
+    parser = argparse.ArgumentParser(
+        description=(
+            "Persistent reward-ASR worker used by ProcessRewardASRBackend. Loads one ASR model, prints a JSON "
+            "'ready' line to stdout and then answers JSON-lines 'transcribe' requests read from stdin until a "
+            "'shutdown' request arrives. See the module docstring for the message formats."
+        )
+    )
+    parser.add_argument(
+        "--backend",
+        choices=("nemo", "qwen"),
+        required=True,
+        help="ASR implementation to load: 'nemo' (NeMo ASR, reward backend type nemo_process) or 'qwen' "
+        "(Qwen3-ASR through the qwen_asr package, reward backend type qwen).",
+    )
+    parser.add_argument(
+        "--model",
+        required=True,
+        help="Model to load: a pretrained NeMo model name or a .nemo path for 'nemo'; a Hugging Face model id or "
+        "local path accepted by Qwen3ASRModel.from_pretrained for 'qwen'.",
+    )
+    parser.add_argument(
+        "--device",
+        required=True,
+        help="Torch device the model runs on, e.g. 'cuda:0'. The parent restricts CUDA_VISIBLE_DEVICES to its own "
+        "GPU before launching the worker, so 'cuda:0' denotes that GPU.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=4,
+        help="Maximum number of audio files per model call: Qwen's max_inference_batch_size, or the chunk size for "
+        "prompted NeMo models (non-prompted NeMo models transcribe each request at once). Default: 4.",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=256,
+        help="Maximum number of generated tokens per transcript for the 'qwen' backend; ignored by 'nemo'. "
+        "Default: 256.",
+    )
+    parser.add_argument(
+        "--language-map",
+        type=json.loads,
+        default={},
+        help="JSON object mapping request language codes to the prompt locales of a prompted NeMo model, e.g. "
+        "'{\"en\": \"en-US\", \"de\": \"de-DE\"}'. Used only by the 'nemo' backend; 'qwen' maps codes to "
+        "language names internally. Default: {}.",
+    )
+    return parser
+
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--backend", choices=("nemo", "qwen"), required=True)
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--device", required=True)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--max-new-tokens", type=int, default=256)
-    parser.add_argument("--language-map", type=json.loads, default={})
-    args = parser.parse_args()
+    args = build_arg_parser().parse_args()
 
     with contextlib.redirect_stdout(sys.stderr):
         transcribe = load_qwen(args) if args.backend == "qwen" else load_nemo(args, args.language_map)

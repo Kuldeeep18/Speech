@@ -100,7 +100,15 @@ class WhisperRewardASRBackend(RewardASRBackend):
 
 
 class NemoRewardASRBackend(RewardASRBackend):
-    """NeMo ASR backend with optional multilingual prompt routing."""
+    """In-process NeMo ASR backend (``type: nemo``) with optional multilingual prompt routing.
+
+    Config keys: ``model_name`` (pretrained name or ``.nemo`` path; default ``nvidia/parakeet-ctc-0.6b``),
+    ``disable_cuda_graphs`` (default False), ``reset_cuda_graphs_before_transcribe`` (default True) and, for
+    prompted models (``EncDecHybridRNNTCTCBPEModelWithPrompt`` / ``EncDecRNNTBPEModelWithPrompt``),
+    ``language_map`` (language code -> prompt locale; default ``DEFAULT_NEMOTRON_LANGUAGE_MAP``; every locale must
+    exist in the model's prompt dictionary) and ``attention_context`` (``[left, right]``; must be one of the
+    encoder's available contexts). Transcripts are returned raw: ``normalizes_transcripts_by_default`` stays False.
+    """
 
     def __init__(self, cfg: Mapping, device_getter: Callable[[], torch.device]):
         self.device_getter = device_getter
@@ -139,6 +147,13 @@ class NemoRewardASRBackend(RewardASRBackend):
                 self.model.encoder.set_default_att_context_size(attention_context)
 
     def transcribe(self, audio_paths: Sequence[str], languages: Sequence[str]) -> List[str]:
+        """Transcribe ``audio_paths`` on ``device_getter()`` and return one transcript per path, in order.
+
+        Non-prompted models transcribe the whole batch in one call and ignore ``languages``. Prompted models are
+        run once per language with ``target_lang=language_map[language]`` and ``<lang>`` tags are stripped from
+        their output; a language without a ``language_map`` entry raises ``ValueError``. Unless CUDA graphs are
+        disabled, the decoder's graphs are re-captured first (``reset_cuda_graphs_before_transcribe``).
+        """
         self.model.to(self.device_getter())
         if (
             self.reset_cuda_graphs_before_transcribe
@@ -184,7 +199,21 @@ class NemoRewardASRBackend(RewardASRBackend):
 
 
 class ProcessRewardASRBackend(RewardASRBackend):
-    """Persistent ASR worker isolated from the TTS model's CUDA context."""
+    """Persistent ASR worker process (``type: nemo_process`` or ``type: qwen``) isolated from the TTS CUDA context.
+
+    Runs ``scripts/tts/reward_asr_worker.py`` and exchanges one JSON object per line with it over stdin/stdout
+    (see that module's docstring). Config keys: ``worker_backend`` (``nemo`` for ``type: nemo_process``, otherwise
+    the ``type``; a missing ``type`` means ``qwen``, so a ``nemo_process`` entry must set ``type`` or
+    ``worker_backend`` explicitly), ``python_executable`` (default ``/opt/qwen_asr/bin/python`` for ``qwen`` and
+    ``sys.executable`` for ``nemo``; must exist), ``worker_script`` (default: the repository's
+    ``scripts/tts/reward_asr_worker.py``, resolved relative to this package), ``model_name`` (default
+    ``Qwen/Qwen3-ASR-0.6B`` for ``qwen`` and ``nvidia/nemotron-3.5-asr-streaming-0.6b`` for ``nemo``),
+    ``batch_size`` (default 4), ``max_new_tokens`` (default 256; ``qwen`` only), ``timeout_seconds`` (default 300),
+    ``attention_context`` (``nemo`` only) and ``language_map`` (default ``DEFAULT_NEMOTRON_LANGUAGE_MAP``). The
+    worker starts lazily on the first :meth:`transcribe` call, pinned to the GPU behind ``device_getter()``; its
+    stderr is appended to ``<tempdir>/<worker_backend>_asr_worker_<pid>_<device_index>.log``. Transcripts are
+    returned raw.
+    """
 
     def __init__(self, cfg: Mapping, device_getter: Callable[[], torch.device]):
         self.device_getter = device_getter
@@ -312,6 +341,7 @@ class ProcessRewardASRBackend(RewardASRBackend):
         return transcripts
 
     def transcribe(self, audio_paths: Sequence[str], languages: Sequence[str]) -> List[str]:
+        """Transcribe through the worker, restarting it once if the request fails, times out or the pipe breaks."""
         try:
             return self._request(audio_paths, languages)
         except (BrokenPipeError, TimeoutError, RuntimeError):
@@ -321,6 +351,7 @@ class ProcessRewardASRBackend(RewardASRBackend):
             return self._request(audio_paths, languages)
 
     def close(self) -> None:
+        """Ask the worker to shut down (terminating or killing it if it does not exit) and close its stderr log."""
         process = self.process
         self.process = None
         if process is not None and process.poll() is None:
